@@ -104,6 +104,17 @@ fn collect(selector: &Selector) -> Vec<Check> {
     checks.extend(device_checks(selector));
     checks.push(synapse_check());
     checks.push(temperature_check());
+    checks.push(match crate::gpu::read_percent() {
+        Ok(percent) => Check::pass(
+            "gpu",
+            format!("{percent:.0}% via IOKit accelerator statistics"),
+        ),
+        Err(e) => Check::fail(
+            "gpu",
+            format!("{e:#}"),
+            "GPU-aware control requires a readable macOS AGXAccelerator utilization counter",
+        ),
+    });
     checks.push(config_check());
     checks.push(service_check());
     checks

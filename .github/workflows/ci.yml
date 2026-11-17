@@ -1,66 +1,29 @@
-# Build and test. Everything that can run on Linux does (GitHub-hosted
-# runner); the macOS-specific code paths (IOKit temperature source, launchd
-# service, the mac hidapi backend) build and test on a self-hosted macOS
-# runner — register one under Settings → Actions → Runners with the default
-# "self-hosted" and "macOS" labels.
 name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
+on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  test-linux:
-    name: build & test (Linux)
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - name: Install libudev (hidapi build dependency)
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+          components: rustfmt, clippy
+      - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - run: cargo build --locked --all-targets
-      - run: cargo test --locked
-
-  test-macos:
-    name: build & test (macOS, self-hosted)
-    runs-on: [self-hosted, macOS]
-    # Never run fork PRs on the self-hosted runner.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - name: Ensure Rust toolchain
-        run: |
-          if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Ensure clippy
-        run: rustup component add clippy
-      # macOS-only modules are invisible to the Linux clippy job, so lint
-      # them here too.
+      - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - run: cargo build --locked --release
+      - run: cargo build --release --locked
+      - if: runner.os == 'macOS'
+        run: xcrun swiftc -O tools/metal-load.swift -o /tmp/padctl-metal-load

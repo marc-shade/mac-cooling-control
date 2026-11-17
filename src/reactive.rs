@@ -43,10 +43,10 @@ impl<'a> DriverModeGuard<'a> {
 
 impl Drop for DriverModeGuard<'_> {
     fn drop(&mut self) {
-        if self.active {
-            if let Err(e) = self.pad.send(&rgb::device_mode(0x00)) {
-                eprintln!("warning: failed to restore normal device mode: {e:#}");
-            }
+        if self.active
+            && let Err(e) = self.pad.send(&rgb::device_mode(0x00))
+        {
+            eprintln!("warning: failed to restore normal device mode: {e:#}");
         }
     }
 }

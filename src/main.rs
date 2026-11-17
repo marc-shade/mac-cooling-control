@@ -20,7 +20,7 @@ struct Cli {
     verbose: bool,
 
     /// After each command, read back the device status and fail if it was
-    /// rejected (best effort)
+    /// rejected or the acknowledgement does not match
     #[arg(long, global = true)]
     verify: bool,
 
@@ -53,6 +53,8 @@ impl Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read live die temperature and GPU utilization without opening the pad
+    Telemetry,
     /// List the pad's HID interfaces
     List,
     /// Fan control
@@ -71,13 +73,13 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// One-shot overview: fan, brightness, firmware, serial, CPU temperature
+    /// One-shot overview: fan command, brightness, firmware, serial, die temperature
     Status {
         /// Emit machine-readable JSON
         #[arg(long)]
         json: bool,
     },
-    /// Print the current CPU temperature reading the fan curve would use
+    /// Print the hottest die temperature reading the fan curve would use
     Temp {
         /// Emit machine-readable JSON
         #[arg(long)]
@@ -221,6 +223,15 @@ fn run(cli: Cli) -> Result<()> {
 
     // Commands that don't touch the device (or manage it themselves).
     match &cli.cmd {
+        Cmd::Telemetry => {
+            let reader = temp::TempReader::new()?;
+            return print_json(&serde_json::json!({
+                "die_celsius": reader.read()?, "temperature_source": reader.source_name(),
+                "gpu_percent": padctl::gpu::read_percent()?,
+                "thermal_pressure": padctl::gpu::pressure_name(padctl::gpu::thermal_pressure()?),
+                "gpu_source": "IOKit AGXAccelerator Device Utilization %"
+            }));
+        }
         Cmd::Completions { shell } => {
             clap_complete::generate(
                 *shell,
@@ -305,6 +316,14 @@ fn run(cli: Cli) -> Result<()> {
                         file.as_ref().map(|c| &c.curve),
                     )?;
                     println!("curve points: {}", s.points_text);
+                    println!(
+                        "GPU points:   {}",
+                        s.gpu_points
+                            .iter()
+                            .map(|(p, rpm)| format!("{p}:{rpm}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
                     println!("interval:     {}s", s.interval);
                     println!("on exit:      {:?}", s.on_exit);
                     println!("smooth:       {}s", s.smooth);
@@ -360,11 +379,14 @@ fn run(cli: Cli) -> Result<()> {
                 }
                 FanCmd::Get { json } => {
                     let report = pad.read_report()?;
-                    let rpm = fan::rpm_from_report(&report);
+                    let rpm = fan::rpm_from_report(&report).context(
+                        "fan command readback unavailable: last response is not an acknowledged fan command; no tachometer measurement is available")?;
                     if json {
-                        print_json(&serde_json::json!({ "rpm": rpm, "off": rpm == 0 }))?;
+                        print_json(
+                            &serde_json::json!({ "commanded_rpm": rpm, "off": rpm == 0, "measured_rpm": null }),
+                        )?;
                     } else {
-                        println!("{rpm} RPM");
+                        println!("{rpm} RPM commanded (not measured)");
                     }
                 }
             }
@@ -491,27 +513,30 @@ fn run(cli: Cli) -> Result<()> {
                     Err(_) => (None, None),
                 };
                 print_json(&serde_json::json!({
-                    "fan_rpm": rpm,
-                    "fan_off": rpm == 0,
-                    "fan_percent": if rpm == 0 { None } else { Some(fan::rpm_to_percent(rpm)) },
+                    "fan_commanded_rpm": rpm,
+                    "fan_measured_rpm": null,
+                    "fan_off": rpm.map(|r| r == 0),
+                    "fan_percent": rpm.filter(|r| *r != 0).map(fan::rpm_to_percent),
                     "brightness_percent": brightness_pct,
                     "firmware": format!("{}.{}", fw.args[0], fw.args[1]),
                     "serial": rgb::serial_text(&serial),
-                    "cpu_temp_celsius": celsius,
+                    "die_temp_celsius": celsius,
                     "temp_source": source,
                 }))?;
             } else {
-                if rpm == 0 {
-                    println!("fan:        off");
-                } else {
-                    println!("fan:        {rpm} RPM (~{}%)", fan::rpm_to_percent(rpm));
+                match rpm {
+                    Some(0) => println!("fan:        commanded off"),
+                    Some(rpm) => println!("fan:        {rpm} RPM commanded (not measured)"),
+                    None => println!(
+                        "fan:        command readback unavailable (last reply was not a fan acknowledgement)"
+                    ),
                 }
                 println!("brightness: {brightness_pct}%");
                 println!("firmware:   v{}.{}", fw.args[0], fw.args[1]);
                 println!("serial:     {}", rgb::serial_text(&serial));
                 match temp {
-                    Ok((t, source)) => println!("cpu temp:   {t:.1}°C ({source})"),
-                    Err(e) => println!("cpu temp:   unavailable ({e:#})"),
+                    Ok((t, source)) => println!("die temp:   {t:.1}°C ({source})"),
+                    Err(e) => println!("die temp:   unavailable ({e:#})"),
                 }
             }
         }
@@ -547,6 +572,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         // Handled before the device was opened.
         Cmd::Config { .. }
+        | Cmd::Telemetry
         | Cmd::Service { .. }
         | Cmd::Completions { .. }
         | Cmd::Manpage

@@ -43,16 +43,48 @@ pub fn off() -> Packet {
     Packet::new(TID_FAN, CLASS_FAN, 0x10, 0x03, &[0x00, 0x06, 0x00, 0x00])
 }
 
-/// Extract the current RPM from a feature report read (leading report-ID
-/// byte included), as the Windows plugin does: bytes 11-12 little-endian,
-/// times 50.
-pub fn rpm_from_report(report: &[u8; REPORT_LEN]) -> u32 {
-    (report[11] as u32 | (report[12] as u32) << 8) * 50
+/// Decode an acknowledged fan command, not a measured tachometer speed.
+/// Other queries replace the shared report buffer, making RPM unknown.
+pub fn rpm_from_report(report: &[u8; REPORT_LEN]) -> Option<u32> {
+    if report[0] != 0
+        || report[1] != 2
+        || report[2] != TID_FAN
+        || report[7] != CLASS_FAN
+        || report[89] != crate::packet::crc(&report[1..])
+    {
+        return None;
+    }
+    match (report[8], report[9], report[10]) {
+        (0x10, 0, 6) => Some(0),
+        (1, 1, 5) => {
+            let rpm = (report[11] as u32 | (report[12] as u32) << 8) * RPM_STEP;
+            (MIN_RPM..=MAX_RPM).contains(&rpm).then_some(rpm)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_lighting_response_and_unacknowledged_fan_command() {
+        let mut report = crate::rgb::brightness_get().to_report();
+        report[1] = 2;
+        report[11] = 255;
+        report[89] = crate::packet::crc(&report[1..]);
+        assert_eq!(rpm_from_report(&report), None);
+        let mut report = set_rpm(1500).to_report();
+        assert_eq!(rpm_from_report(&report), None);
+        report[1] = 2;
+        assert_eq!(rpm_from_report(&report), Some(1500));
+        report[11] ^= 1;
+        assert_eq!(rpm_from_report(&report), None);
+        let mut report = off().to_report();
+        report[1] = 2;
+        assert_eq!(rpm_from_report(&report), Some(0));
+    }
 
     #[test]
     fn percent_round_trip_edges() {

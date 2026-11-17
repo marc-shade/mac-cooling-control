@@ -1,331 +1,149 @@
-# padctl
+# Mac Cooling Control
 
-CLI to control the fans and RGB lighting of a **Razer Laptop Cooling Pad**
-(USB `1532:0f43`) on macOS, where Razer ships no support for it.
+GPU-aware automatic control of the Razer Laptop Cooling Pad on macOS.
+The `padctl` CLI reads real die-temperature sensors and Apple GPU utilization,
+then commands the higher of the temperature and GPU fan targets. It can run
+as a user login service or an interactive terminal dashboard.
 
-Talks to the pad's HID control interface (interface 0) via feature reports —
-no drivers, no kexts, no root. Protocol replicated byte-for-byte from two
-known-good implementations: a Windows
-[FanControl](https://github.com/Rem0o/FanControl.Releases) plugin for the fan
-commands, and [openrazer](https://github.com/openrazer/openrazer)'s accessory
-driver (`driver/razerchromacommon.c`) for the lighting commands.
+This project is derived from [Harold Martin's padctl](https://github.com/hbmartin/razer-cooling-pad-mac).
+The original MIT license and upstream history are retained. It is independent
+of Razer and Apple and does not change CPU/GPU power limits.
 
-## Install
+## Hardware and behavior
 
-Homebrew (tap):
+The control interface must appear as USB `1532:0f43`. A generic USB hub alone
+is not sufficient. On the development machine, moving to another USB-A port
+on the same dock exposed both Razer HID interfaces.
 
-```bash
-brew tap hbmartin/tap
-brew install padctl
+- Temperature input: hottest available `PMU tdie` or `MTR Temp Sensor` reading.
+- GPU input: IOKit `AGXAccelerator` / `Device Utilization %`.
+- The higher requested speed wins. GPU load can ramp cooling before heat builds.
+- Temperature smoothing and a delayed downward transition limit fan oscillation.
+- The hottest configured temperature bypasses smoothing.
+- macOS serious or critical thermal pressure requests at least 3000 RPM.
+- Missing telemetry requests a 3000 RPM failsafe and logs the error.
+- Missing temperature readings at startup cause an error, not invented Celsius values.
+- `--verify` checks the device response, checksum, transaction and fan-command value.
+- A device lock prevents competing padctl instances within one user account.
+- The loop probes USB liveness each poll and reconnects after unplug/replug.
+
+Fan RPM is an acknowledged command, **not a measured tachometer speed**.
+An unrelated lighting/firmware reply makes fan readback unavailable rather
+than displaying arbitrary bytes as a speed. See [validation](docs/VALIDATION.md).
+
+## Build and install
+
+Requires macOS, Rust 1.99.0 and Xcode Command Line Tools. Linux builds support
+protocol tests; the automatic GPU controller requires macOS.
+
+```sh
+git clone https://github.com/marc-shade/mac-cooling-control.git
+cd mac-cooling-control
+rustup toolchain install 1.99.0
+export PATH="$(dirname "$(rustup which --toolchain 1.99.0 rustc)"):$PATH"
+cargo build --release --locked
+mkdir -p ~/.local/bin
+install -m 755 target/release/padctl ~/.local/bin/padctl
+~/.local/bin/padctl doctor --json
+~/.local/bin/padctl telemetry
 ```
 
-crates.io:
+Commands need access to IOKit/HID. A restricted execution sandbox can block
+both sensors and USB access. The native process does not require root on the
+validated machine.
 
-```bash
-cargo install padctl
-```
+## Automatic cooling
 
-Prebuilt binary — tagged releases attach a universal (arm64 + x86_64) macOS
-binary. It is ad-hoc signed, so if you download it **via a browser**
-Gatekeeper will quarantine it; clear the flag once:
+Copy `config.example.toml` to `~/.config/padctl/config.toml` after checking for
+an existing configuration, or use `padctl config init` to create one without
+overwriting. Command-line options override the configuration.
 
-```bash
-tar xzf padctl-*-macos-universal.tar.gz
-xattr -d com.apple.quarantine padctl   # only needed for browser downloads
-```
-
-(`curl`/`brew`/`cargo` installs don't set the quarantine attribute.)
-
-From source:
-
-```bash
-cargo build --release   # -> target/release/padctl (self-contained)
-```
-
-Shell completions and a man page are built in:
-
-```bash
-padctl completions zsh > ~/.zfunc/_padctl     # also bash/fish/elvish/powershell
-padctl manpage > /usr/local/share/man/man1/padctl.1
-```
-
-## Usage
-
-```bash
-padctl list                        # show the pad's HID interfaces (+ serials)
-padctl info                        # firmware version + serial
-padctl status                      # fan, brightness, firmware, serial, CPU temp
-padctl doctor                      # diagnose common problems (also: --json)
-
-# Fans (500-3200 RPM, 50 RPM steps)
-padctl fan set 1500
-padctl fan set 60%
-padctl fan set off                 # also: 0 or 0%
-padctl fan get
-padctl fan off
-
-# Lighting (18-LED strip)
-padctl rgb static ff6600
-padctl rgb spectrum
-padctl rgb wave --dir left --speed 40
-padctl rgb breath 0000ff           # 0 colors = random, 1 = single, 2 = dual
-padctl rgb brightness 75           # no value: read current
-padctl rgb off
-
-# Per-LED custom frames (experimental on this device, see below)
-padctl rgb custom ff0000 00ff00 0000ff   # 1-18 colors, stretched to fit
-padctl rgb gradient 0000ff ff0000        # linear gradient across the strip
-padctl rgb thermal                       # live CPU-temp meter, green→red
-
-# Temperature
-padctl temp                        # the reading the fan curve would use
-padctl sensors                     # every sensor padctl can see
-
-# Machine-readable output for scripting (also: info, temp, sensors, fan get)
-padctl status --json | jq .cpu_temp_celsius
-
-# Automatic fan curve from CPU temperature (Ctrl-C to stop)
-padctl curve                       # defaults: 55:800,65:1500,75:2200,85:3200
-padctl curve --points "50:0,60:1200,75:2400,85:3200" --interval 5 --on-exit off
-padctl curve --smooth 15 --down-delay 30
-padctl curve --dry-run             # print decisions without touching the pad
-
-# Live dashboard for the curve, with in-place tuning (same flags as curve)
-padctl watch
-padctl watch --dry-run             # observe/tune without touching the pad
-
-# Protocol exploration: send a raw 90-byte packet (zero-padded)
-padctl raw "00 1f 00 00 00 03 0f 84 01 00" --auto-crc --read
-```
-
-Global flags on every command:
-
-- `-v` enables debug logging: raw packets sent/received, every curve poll.
-- `--verify` reads back the device status after each command and fails
-  loudly if the device rejected it (best effort).
-- `--serial <S>` / `--path <P>` select a specific pad when more than one is
-  plugged in (values shown by `padctl list`).
-
-## The fan curve
-
-`padctl curve` reads CPU die temperature from the SMC sensors (the same
-private `IOHIDEventSystemClient` API used by macmon/stats — no root needed).
-If that API is unavailable it falls back to coarse thermal-pressure
-estimates. A curve point with RPM `0` means "fans off"; interpolated targets
-below 500 RPM also turn the fans off.
-
-The loop is built to run unattended:
-
-- **Smoothing** — readings go through an exponential moving average
-  (`--smooth`, default 15 s time constant; 0 disables) so brief load spikes
-  don't rev the fans.
-- **Asymmetric ramping** — spin-up is immediate, spin-down waits until the
-  lower target persists (`--down-delay`, default 30 s; 0 disables), on top
-  of a 100 RPM hysteresis band. No more oscillating fan noise.
-- **Reconnect** — if the pad is unplugged, replugged, or the machine sleeps,
-  the curve keeps running and re-attaches automatically.
-- **Sleep/wake aware** (macOS) — the loop registers for system power
-  notifications (`IORegisterForSystemPower`): before the machine sleeps it
-  turns the fans off (unless `--on-exit keep`), so a closed laptop doesn't
-  sit on spinning fans all night; on wake it reconnects immediately,
-  restores the configured lighting, and resends the right fan speed instead
-  of waiting for the next send to fail. Temperature smoothing restarts on
-  wake so hours-stale readings don't drag the average.
-- **Signals** — SIGINT/SIGTERM/SIGHUP all trigger the `--on-exit` behavior
-  (`off` by default), so `launchctl bootout` and plain `kill` are safe.
-- **Quiet logs** — every line is timestamped, but only *decision changes*
-  are logged (a new speed sent, or the start of a pending spin-down), plus a
-  status heartbeat every 10 minutes so the log shows the loop is alive. Run
-  with `-v` to see every poll. At the default 5 s poll interval this keeps
-  an unattended log file to a few lines per hour instead of thousands.
-
-## Tune it live (`padctl watch`)
-
-`padctl watch` runs the exact same control loop as `padctl curve` (same
-flags, same config file, same smoothing/governor logic) but renders it as a
-live terminal dashboard instead of log lines: raw vs smoothed temperature,
-target vs actual RPM (read back from the pad), the curve shape with the
-current operating point, and a scrolling panel of recent decisions.
-
-Tuning happens in place — no restart cycles:
-
-| Key | Action |
-| --- | --- |
-| `S` / `s` | smoothing time constant +1 s / −1 s (0 disables) |
-| `D` / `d` | spin-down delay +5 s / −5 s (0 disables) |
-| `Tab` / `Shift-Tab` | select a curve point |
-| `↑` / `↓` | selected point RPM ±50 (below 500 snaps to off) |
-| `←` / `→` | selected point temperature ±1 °C |
-| `w` | write the current tuning to `~/.config/padctl/config.toml` |
-| `r` | reset tuning to the startup values |
-| `Space` | pause/resume the control loop |
-| `q` / `Esc` / `Ctrl-C` | quit (honors `--on-exit`, default `off`) |
-
-Changes take effect on the next control tick (forced immediately on every
-keypress). `w` updates only the `[curve]` tuning keys and keeps the rest of
-the config file — comments, `[lighting]` — intact; if you quit with unsaved
-changes, the equivalent `--points/--smooth/--down-delay` flags are printed
-so nothing is lost. With `--dry-run` the dashboard never touches the pad,
-so it's safe to run alongside the launchd service while experimenting
-(without `--dry-run`, stop the service first — two writers would fight
-over the fan). `-v` records every poll in the decisions panel, not just
-decision changes.
-
-## Run it at login (launchd service)
-
-```bash
-padctl config init                 # write ~/.config/padctl/config.toml
-padctl service install             # LaunchAgent: runs `padctl curve` at login
-padctl service status
+```sh
+~/.local/bin/padctl --verify curve
+# Or install and start the user login service:
+~/.local/bin/padctl service install
+~/.local/bin/padctl service status
+~/.local/bin/padctl telemetry
 tail -f ~/Library/Logs/padctl.log
-padctl service uninstall
 ```
 
-The service runs plain `padctl curve`, which reads its settings from
-`~/.config/padctl/config.toml` — edit the config (see `padctl config show`)
-instead of baking flags into the plist. CLI flags override the config for
-interactive runs. Install from a stable binary location (e.g.
-`/usr/local/bin/padctl`), not a build tree.
+The example configuration uses these targets:
 
-## Lighting at login
+| Die temperature | RPM | GPU use | RPM |
+|---|---:|---|---:|
+| 45°C | 1000 | 0% | 1000 |
+| 55°C | 1400 | 20% | 1400 |
+| 65°C | 2000 | 50% | 2000 |
+| 75°C | 2600 | 80% | 2600 |
+| 85°C | 3000 | 100% | 3000 |
 
-The config file's `[lighting]` section describes the lighting you want, and
-the fan curve applies it on startup and on every reconnect — so the launchd
-service restores your preferred look at login and after the pad is
-unplugged/replugged (the pad forgets custom frames when it loses power):
+Targets interpolate between points. The example polls every two seconds,
+uses five-second temperature smoothing and a 30-second downward delay.
+`on_exit = "keep"` keeps the fan running at its last command when stopped
+or asleep. These settings are configurable and are not universal thermal limits.
 
-```toml
-[lighting]
-effect = "static"        # off | static | spectrum | wave | breath | gradient | custom
-colors = ["ff6600"]      # static: 1, breath: 0-2, gradient: 2, custom: 1-18
-brightness = 80          # 0-100, applied before the effect
-#wave_dir = "right"      # wave only
-#wave_speed = 40         # wave only
-#driver_mode = false     # gradient/custom only (experimental effects)
+Stop the service before issuing manual hardware commands or running the
+interactive controller:
+
+```sh
+launchctl bootout gui/$(id -u)/io.github.hbmartin.padctl
+~/.local/bin/padctl --verify fan set 1500
+~/.local/bin/padctl --verify watch
+# Restart after finishing manual control or editing the config:
+~/.local/bin/padctl service install
 ```
 
-Apply it on demand without touching the fans:
+The upstream LaunchAgent identifier is retained for compatibility.
+`watch --dry-run` reads real telemetry and displays decisions without opening
+the pad, so it can run alongside the service. Arrow keys edit temperature
+curve points, `S/s` changes smoothing, `D/d` changes downward delay, `w` saves
+and `q` quits. GPU curve points are edited in the configuration.
 
-```bash
-padctl rgb apply
+## Diagnostics and lighting
+
+```sh
+padctl list
+padctl doctor --json       # stop the service first
+padctl status --json       # stop the service first
+padctl temp --json
+padctl sensors --json
+padctl telemetry           # safe alongside the service
+padctl --verify rgb static ff0000
+padctl --verify rgb spectrum
+padctl --verify rgb brightness 50
 ```
 
-## Custom frames / thermal lighting (experimental)
+`fan get` reports the last acknowledged fan command. Lighting/firmware
+queries replace that response buffer: `fan get` then returns an error and
+`status` reports a null commanded RPM. Neither measures actual RPM.
 
-`rgb custom`, `rgb gradient`, and `rgb thermal` drive the strip per-LED via
-extended-matrix custom frames. The packet layout follows openrazer's closest
-relatives of this pad (Laptop Stand Chroma, Base Station V2 Chroma —
-transaction id `0x1F`, dynamic packet length), but the cooling pad itself has
-no upstream custom-frame implementation to copy, so treat these as
-experimental. If the lighting doesn't change, retry with `--driver-mode`,
-which switches the device to driver mode first (normal mode is restored on
-exit).
+## Development and validation
 
-`rgb thermal` polls the CPU temperature and renders it live: `--style meter`
-(default) lights 0-18 LEDs green→red like a level meter, `--style solid`
-shifts the whole strip's color.
-
-## Linux
-
-macOS is the primary target, but the crate builds, lints, and tests on Linux
-(hidraw backend, temperatures from `/sys/class/thermal`), which is also what
-CI uses for most checks. Building needs `libudev-dev` and `pkg-config`.
-Talking to the pad on Linux requires a udev rule granting access to the
-hidraw node, and `padctl service` is macOS-only.
-
-## Development
-
-```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
+```sh
 cargo fmt --all --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+xcrun swiftc -O tools/metal-load.swift -o /tmp/padctl-metal-load
+/tmp/padctl-metal-load 60
 ```
 
-The crate is a library (`src/lib.rs`, all protocol/parsing/curve logic)
-plus a thin CLI binary (`src/main.rs`). Everything that parses untrusted
-input — CLI speed/color/hex arguments, curve points, config TOML, raw
-device responses — is covered two ways:
+The Metal program is a synthetic matrix workload with checked outputs and
+GPU timestamps, not an application performance benchmark. The opt-in hardware
+failsafe test sends real fan commands and requires the service to be stopped:
 
-- **Property tests** (`tests/properties.rs`, [proptest]): never-panic and
-  round-trip/invariant checks, run by every `cargo test`.
-- **Fuzz targets** (`fuzz/`, [cargo-fuzz]): coverage-guided fuzzing of the
-  same surfaces. `cargo install cargo-fuzz`, then
-  `cargo +nightly fuzz run parse_speed` (see `cargo fuzz list` for all
-  targets). CI smoke-runs every target weekly.
+```sh
+cargo test hardware_sensor_failure -- --ignored --nocapture
+```
 
-[proptest]: https://github.com/proptest-rs/proptest
-[cargo-fuzz]: https://github.com/rust-fuzz/cargo-fuzz
+Raw local validation files and installation records are gitignored. Public
+results in `docs/VALIDATION.md` distinguish hardware checks, software tests,
+manual observations and limitations.
 
-CI (GitHub Actions):
+## Gaps / not covered
 
-- **Lint** and **Linux build/test** run on GitHub-hosted `ubuntu-latest`.
-- **macOS build/test/clippy** — the parts Linux can't check (IOKit
-  temperature source, launchd service, mac hidapi backend) — run on a
-  **self-hosted macOS runner**. Register one under *Settings → Actions →
-  Runners* with the default `self-hosted` + `macOS` labels; the jobs are
-  guarded so fork PRs never reach it.
-- **Release**: pushing a `v*` tag builds a universal binary on the mac
-  runner and attaches it to a GitHub release. Two follow-up jobs then run on
-  GitHub-hosted runners, each skipping itself cleanly if its secret is not
-  configured: publishing the crate to crates.io (`CARGO_REGISTRY_TOKEN`) and
-  pushing an updated formula to `hbmartin/homebrew-tap`
-  (`HOMEBREW_TAP_TOKEN`, a PAT with push access to the tap).
-- **Fuzz** smoke-runs each cargo-fuzz target for a minute, weekly and on
-  PRs touching `fuzz/`.
-- **Dependabot** files weekly PRs for Cargo dependencies and pinned
-  workflow actions.
-
-## Protocol notes
-
-Every command is a 91-byte HID feature report: report id `0x00` + a 90-byte
-Razer packet:
-
-| bytes  | meaning                                              |
-|--------|------------------------------------------------------|
-| 0      | status (send `0x00`; response `0x02`=OK, `0x01`=busy)|
-| 1      | transaction id (`0x02` fan, `0x1f` rgb/info)         |
-| 2–4    | remaining packets + protocol type (zero)             |
-| 5      | data size                                            |
-| 6, 7   | command class, command id                            |
-| 8–87   | arguments                                            |
-| 88     | crc = XOR of bytes 2..=87                            |
-| 89     | `0x00`                                               |
-
-Known commands (class/cmd, arguments from byte 8):
-
-- Fan set: `0x0d/0x01`, args `01 05 <lo> <hi>` where the 16-bit value is RPM/50
-- Fan off: `0x0d/0x10`, args `00 06`
-- Fan read: plain GetFeature; RPM/50 at packet bytes 10–11
-- RGB effects: `0x0f/0x02`, args `01 00 <effect> ...` (0=off, 1=static+RGB,
-  2=breath, 3=spectrum, 4=wave+dir+speed)
-- Custom frame store: `0x0f/0x03`, args `00 00 <row> <start> <stop> <rgb...>`,
-  data size = 3×LEDs + 5; apply with effect `0x08` (args `00 00 08`, ds `0x0c`)
-- Brightness: `0x0f/0x04` set / `0x0f/0x84` get, args `01 00 <0-255>`
-- Device mode: `0x00/0x04`, args `<mode> 00` (0=normal, 3=driver)
-- Firmware `0x00/0x81`, serial `0x00/0x82` (query then read)
-
-Queries (`0x8x` commands) are sent, then the response is read back with
-GetFeature after ~100 ms; busy responses are retried.
-
-## Troubleshooting
-
-Run `padctl doctor` first — it automates every check below (device found,
-control interface opens, protocol responds, brightness stuck at 0, Razer
-Synapse running, temperature source, config validity, service health) and
-prints a concrete fix for anything it flags. `--json` for scripting; the
-exit code is non-zero when a check fails.
-
-- **Open fails with a permission error** — grant your terminal app *Input
-  Monitoring* in System Settings → Privacy & Security (usually not needed:
-  the control interface has no input reports).
-- **Pad not found** — check `system_profiler SPUSBDataType | grep -A6 Cooling`.
-- **Commands accepted but nothing happens** — quit Razer Synapse
-  (`RazerAppEngine`) in case it is fighting over the device; unplug/replug
-  the pad as a last resort. `--verify` makes rejects visible.
-- **No visible lighting change** — brightness may be persisted at 0:
-  `padctl rgb brightness 100` first.
-- **Custom frames show nothing** — try `--driver-mode` (see above).
-
-## License
-
-[MIT](LICENSE)
+The private Apple temperature API and GPU counter may change across macOS
+versions. Sensor names are not a verified CPU/GPU core map. An unplugged or
+unpowered pad cannot execute failsafe commands. Acknowledgements do not prove
+physical RPM or airflow. Independent RPM/noise measurement requires external
+instruments. This is a CLI and service, not a notarized GUI application.
+See the validation record for the exact tests performed and remaining gaps.

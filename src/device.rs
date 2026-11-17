@@ -104,8 +104,7 @@ impl Selector {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenOpts {
     /// After each command, read back the device status and fail loudly if
-    /// the device rejected it (best effort: skipped when the device does
-    /// not echo the command).
+    /// the device rejected it or the acknowledgement does not match.
     pub verify: bool,
 }
 
@@ -121,6 +120,8 @@ fn candidates<'a>(api: &'a HidApi, selector: &Selector) -> Vec<&'a DeviceInfo> {
 pub struct Pad {
     dev: Box<dyn Transport>,
     verify: bool,
+    // Held for the lifetime of the connection, including between curve polls.
+    _lock: Option<std::fs::File>,
 }
 
 impl Pad {
@@ -128,6 +129,21 @@ impl Pad {
     /// probing a feature-report read (interface 1 has MaxFeatureReportSize=1
     /// and fails the 91-byte read).
     pub fn open(api: &HidApi, selector: &Selector, opts: OpenOpts) -> Result<Pad> {
+        let home = std::env::var_os("HOME").context("HOME is not set")?;
+        let cache = if cfg!(target_os = "macos") {
+            std::path::PathBuf::from(home).join("Library/Caches/padctl")
+        } else {
+            std::path::PathBuf::from(home).join(".cache/padctl")
+        };
+        std::fs::create_dir_all(&cache).context("creating padctl lock directory")?;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(cache.join("device.lock"))
+            .context("opening padctl device lock")?;
+        lock.try_lock().context("another padctl process owns the controller; stop its curve/service before issuing device commands")?;
         let mut cands = candidates(api, selector);
         if cands.is_empty() {
             bail!(
@@ -153,7 +169,9 @@ impl Pad {
                             info.interface_number(),
                             path
                         );
-                        return Ok(Pad::with_transport(Box::new(dev), opts));
+                        let mut pad = Pad::with_transport(Box::new(dev), opts);
+                        pad._lock = Some(lock);
+                        return Ok(pad);
                     }
                     Err(e) => errors.push(format!("{path}: {e:#}")),
                 },
@@ -174,6 +192,7 @@ impl Pad {
         Pad {
             dev,
             verify: opts.verify,
+            _lock: None,
         }
     }
 
@@ -213,24 +232,33 @@ impl Pad {
         Ok(buf)
     }
 
-    /// Best-effort post-send check: if the device echoes the command we just
-    /// sent, its status byte tells us whether it was accepted.
+    /// Require an acknowledgement matching the command just sent.
     fn confirm(&self, sent: &[u8; REPORT_LEN]) -> Result<()> {
         for _ in 0..=BUSY_RETRIES {
             sleep(QUERY_DELAY);
             let report = self.read_report()?;
             let resp = Response::from_report(&report);
+            if report[89] != crate::packet::crc(&report[1..]) {
+                bail!("verify: invalid response checksum");
+            }
+            if resp.transaction_id != sent[2] {
+                bail!("verify: response transaction does not match");
+            }
             if resp.class != sent[7] || resp.cmd != sent[8] {
-                log::debug!(
+                bail!(
                     "verify: device did not echo the command \
-                     (got class 0x{:02x} cmd 0x{:02x}); skipping check",
+                     (got class 0x{:02x} cmd 0x{:02x})",
                     resp.class,
                     resp.cmd
                 );
-                return Ok(());
             }
             match resp.status {
-                Status::Ok | Status::New => return Ok(()),
+                Status::Ok => {
+                    if resp.class == 0x0d && report[9..13] != sent[9..13] {
+                        bail!("verify: fan acknowledgement contains a different command value");
+                    }
+                    return Ok(());
+                }
                 Status::Busy => continue,
                 status => bail!("device rejected the command: {status}"),
             }
@@ -449,10 +477,10 @@ mod tests {
     }
 
     #[test]
-    fn verify_skips_when_device_does_not_echo() {
+    fn verify_rejects_when_device_does_not_echo() {
         let mock = Mock::default();
         // Device answers with an unrelated report (e.g. the fan status).
         mock.script_read(echo(&crate::fan::off(), 0x02));
-        mock.pad(true).send(&rgb::spectrum()).unwrap();
+        assert!(mock.pad(true).send(&rgb::spectrum()).is_err());
     }
 }

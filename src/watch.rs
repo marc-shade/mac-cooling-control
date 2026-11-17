@@ -170,6 +170,7 @@ struct App<'a> {
     /// Tuning changed since startup/save; hint to press `w`.
     dirty: bool,
     actual_rpm: Option<u32>,
+    gpu_percent: Option<f64>,
     started: Instant,
     last_tick: Option<Instant>,
     next_tick: Instant,
@@ -187,12 +188,14 @@ impl<'a> App<'a> {
         lighting: Option<lighting::Plan>,
     ) -> Self {
         let now = Instant::now();
+        let mut controller = Controller::new(
+            s.points.clone(),
+            s.smooth,
+            Duration::from_secs(s.down_delay),
+        );
+        controller.configure_gpu(s.gpu_points.clone());
         App {
-            controller: Controller::new(
-                s.points.clone(),
-                s.smooth,
-                Duration::from_secs(s.down_delay),
-            ),
+            controller,
             interval: Duration::from_secs(s.interval),
             dry_run,
             verbose,
@@ -216,6 +219,7 @@ impl<'a> App<'a> {
             quit: false,
             dirty: false,
             actual_rpm: None,
+            gpu_percent: None,
             started: now,
             last_tick: None,
             next_tick: now,
@@ -272,10 +276,28 @@ impl<'a> App<'a> {
         }
 
         let now = Instant::now();
-        let raw = match self.reader.read() {
+        self.gpu_percent = None;
+        let raw = match crate::gpu::read_percent().and_then(|percent| {
+            self.gpu_percent = Some(percent);
+            self.controller.set_gpu_load(percent)?;
+            self.controller
+                .apply_pressure(crate::gpu::thermal_pressure()?);
+            self.reader.read()
+        }) {
             Ok(raw) => raw,
             Err(e) => {
                 self.push_event(EventKind::Warn, format!("temperature read failed: {e:#}"));
+                match crate::curve::sensor_failure(&self.pad, self.dry_run) {
+                    Ok(()) => self.push_event(
+                        EventKind::Warn,
+                        "sensor unavailable; failsafe target 3000 RPM".into(),
+                    ),
+                    Err(e) => {
+                        self.push_event(EventKind::Warn, format!("failsafe command failed: {e:#}"));
+                        self.pad = None;
+                    }
+                }
+                self.controller.reset();
                 return;
             }
         };
@@ -356,7 +378,7 @@ impl<'a> App<'a> {
             && let Some(p) = &self.pad
         {
             match p.read_report() {
-                Ok(report) => self.actual_rpm = Some(fan::rpm_from_report(&report)),
+                Ok(report) => self.actual_rpm = fan::rpm_from_report(&report),
                 Err(e) => {
                     self.push_event(
                         EventKind::Warn,
@@ -653,16 +675,26 @@ fn tile<'t>(title: &'t str, value: String, color: Color) -> Paragraph<'t> {
 }
 
 fn draw_tiles(f: &mut Frame, app: &App, area: Rect) {
-    let [raw, smoothed, target, actual] = Layout::horizontal([
-        Constraint::Percentage(25),
-        Constraint::Percentage(25),
-        Constraint::Percentage(25),
-        Constraint::Percentage(25),
+    let [raw, smoothed, gpu, target, actual] = Layout::horizontal([
+        Constraint::Percentage(20),
+        Constraint::Percentage(20),
+        Constraint::Percentage(20),
+        Constraint::Percentage(20),
+        Constraint::Percentage(20),
     ])
     .areas(area);
     let last = app.history.back();
     let fmt_temp = |v: Option<f64>| v.map_or("—".into(), |v| format!("{v:.1}°C"));
     f.render_widget(tile("raw", fmt_temp(last.map(|s| s.raw)), RAW_COLOR), raw);
+    f.render_widget(
+        tile(
+            "GPU use",
+            app.gpu_percent
+                .map_or("unavailable".into(), |p| format!("{p:.0}%")),
+            TARGET_COLOR,
+        ),
+        gpu,
+    );
     f.render_widget(
         tile(
             "smoothed",
@@ -685,7 +717,7 @@ fn draw_tiles(f: &mut Frame, app: &App, area: Rect) {
     );
     f.render_widget(
         tile(
-            "actual",
+            "command echo",
             app.actual_rpm.map_or("n/a".into(), rpm_text),
             ACTUAL_COLOR,
         ),
@@ -755,7 +787,7 @@ fn draw_rpm_chart(f: &mut Frame, app: &App, area: Rect) {
             .style(Style::new().fg(TARGET_COLOR))
             .data(&target),
         Dataset::default()
-            .name("actual")
+            .name("command echo")
             .marker(symbols::Marker::Dot)
             .style(Style::new().fg(ACTUAL_COLOR))
             .data(&actual),

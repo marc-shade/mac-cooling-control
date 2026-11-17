@@ -1,4 +1,7 @@
 /target
+/validation
+/LOCAL-SETUP.md
+/dist
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts

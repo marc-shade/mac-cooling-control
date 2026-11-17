@@ -1,0 +1,7 @@
+[curve]
+points = "45:1000,55:1400,65:2000,75:2600,85:3000"
+gpu_points = "0:1000,20:1400,50:2000,80:2600,100:3000"
+interval = 2
+smooth = 5
+down_delay = 30
+on_exit = "keep"

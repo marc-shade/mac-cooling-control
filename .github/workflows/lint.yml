@@ -1,54 +1,16 @@
-# Lint runs entirely on Linux: rustfmt is platform-independent and clippy
-# covers every module the Linux target compiles (macOS-only code is linted
-# by the self-hosted macOS job in ci.yml).
-name: Lint
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
+name: Manual formatting check
+on: [workflow_dispatch]
 permissions:
   contents: read
-
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  fmt:
-    name: rustfmt
+  format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: '1.99.0'
           components: rustfmt
       - run: cargo fmt --all --check
-
-  clippy:
-    name: clippy (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-        with:
-          components: clippy
-      - name: Install libudev (hidapi build dependency)
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: clippy-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - run: cargo clippy --all-targets --locked -- -D warnings

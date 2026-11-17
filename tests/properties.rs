@@ -71,7 +71,7 @@ proptest! {
     }
 
     #[test]
-    fn valid_points_parse_and_sort(
+    fn points_accept_valid_curves_and_reject_duplicate_or_decreasing_curves(
         pts in proptest::collection::vec(
             (0.0f64..120.0, prop_oneof![Just(0u32), fan::MIN_RPM..=fan::MAX_RPM]),
             1..8,
@@ -82,9 +82,14 @@ proptest! {
             .map(|(t, r)| format!("{t}:{r}"))
             .collect::<Vec<_>>()
             .join(",");
-        let parsed = curve::parse_points(&text).unwrap();
-        prop_assert_eq!(parsed.len(), pts.len());
-        prop_assert!(parsed.windows(2).all(|w| w[0].0 <= w[1].0), "points not sorted");
+        let mut sorted = pts.clone();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let valid = sorted.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 <= w[1].1);
+        let result = curve::parse_points(&text);
+        prop_assert_eq!(result.is_ok(), valid);
+        if valid {
+            prop_assert_eq!(result.unwrap(), sorted);
+        }
     }
 
     #[test]
@@ -95,12 +100,10 @@ proptest! {
         ),
         temp in -50.0f64..200.0,
     ) {
-        let text = pts
-            .iter()
-            .map(|(t, r)| format!("{t}:{r}"))
-            .collect::<Vec<_>>()
-            .join(",");
-        let parsed = curve::parse_points(&text).unwrap();
+        // Exercise interpolation independently, including descending curves
+        // that the public parser now rejects for cooling control.
+        let mut parsed = pts;
+        parsed.sort_by(|a, b| a.0.total_cmp(&b.0));
         let target = curve::target_rpm(&parsed, temp);
         let lo = parsed.iter().map(|p| p.1).min().unwrap();
         let hi = parsed.iter().map(|p| p.1).max().unwrap();

@@ -14,6 +14,7 @@ pub mod curve;
 pub mod device;
 pub mod doctor;
 pub mod fan;
+pub mod gpu;
 pub mod lighting;
 pub mod logging;
 pub mod packet;

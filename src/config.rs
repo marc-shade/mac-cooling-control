@@ -19,6 +19,8 @@ pub struct Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurveConfig {
+    /// GPU utilization percent:RPM points, used as a floor below the temperature target.
+    pub gpu_points: Option<String>,
     /// Curve points as "temp:rpm,temp:rpm,..." (same format as --points).
     pub points: Option<String>,
     /// Seconds between temperature polls.
@@ -58,6 +60,8 @@ pub const TEMPLATE: &str = r#"# padctl configuration.
 [curve]
 # Curve points as "temp°C:RPM" pairs. RPM 0 means fans off.
 #points = "55:800,65:1500,75:2200,85:3200"
+# GPU utilization percent:RPM. Higher of GPU and temperature targets wins.
+#gpu_points = "0:1000,20:1400,50:2000,80:2600,100:3000"
 
 # Seconds between temperature polls.
 #interval = 5

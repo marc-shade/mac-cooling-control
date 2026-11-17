@@ -1,8 +1,7 @@
 //! CPU temperature reading.
 //!
 //! macOS (primary target): SMC temperature sensors via the private
-//! `IOHIDEventSystemClient` API, falling back to coarse
-//! `NSProcessInfo.thermalState` estimates.
+//! `IOHIDEventSystemClient` API. Missing die readings are errors.
 //!
 //! Linux (used for protocol work and CI): sysfs thermal zones.
 
@@ -35,7 +34,7 @@ impl TempReader {
         })
     }
 
-    /// Current CPU temperature estimate in °C.
+    /// Current control temperature in Celsius (hottest die sensor on macOS).
     pub fn read(&self) -> Result<f64> {
         self.inner.read()
     }

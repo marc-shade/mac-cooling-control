@@ -32,6 +32,9 @@ pub enum OnExit {
 
 #[derive(Args, Default)]
 pub struct CurveArgs {
+    /// GPU utilization percent:RPM curve; higher of GPU and temperature targets wins
+    #[arg(long)]
+    pub(crate) gpu_points: Option<String>,
     /// Curve points as temp°C:RPM pairs; RPM 0 means fans off
     /// [default: 55:800,65:1500,75:2200,85:3200]
     #[arg(long)]
@@ -79,6 +82,7 @@ const DEFAULT_DOWN_DELAY: u64 = 30;
 /// Curve settings after merging CLI flags, the config file, and defaults
 /// (in that precedence order).
 pub struct Settings {
+    pub gpu_points: Vec<(f64, u32)>,
     pub points: Vec<(f64, u32)>,
     pub points_text: String,
     pub interval: u64,
@@ -88,6 +92,15 @@ pub struct Settings {
 }
 
 pub fn resolve(args: &CurveArgs, file: Option<&CurveConfig>) -> Result<Settings> {
+    let gpu_text = args
+        .gpu_points
+        .as_deref()
+        .or_else(|| file.and_then(|c| c.gpu_points.as_deref()))
+        .unwrap_or("0:1000,20:1400,50:2000,80:2600,100:3000");
+    let gpu_points = parse_points(gpu_text)?;
+    if gpu_points.iter().any(|(p, _)| *p > 100.0) {
+        bail!("GPU curve utilization must be between 0 and 100 percent");
+    }
     let file_points = file.and_then(|f| f.points.clone());
     let points_text = args
         .points
@@ -125,6 +138,7 @@ pub fn resolve(args: &CurveArgs, file: Option<&CurveConfig>) -> Result<Settings>
         .unwrap_or(DEFAULT_DOWN_DELAY);
 
     Ok(Settings {
+        gpu_points,
         points,
         points_text,
         interval,
@@ -149,6 +163,9 @@ pub fn parse_points(s: &str) -> Result<Vec<(f64, u32)>> {
             .trim()
             .parse()
             .with_context(|| format!("bad RPM in {pair:?}"))?;
+        if !temp.is_finite() || !(0.0..=125.0).contains(&temp) {
+            bail!("curve temperature must be finite and between 0 and 125 Celsius");
+        }
         if rpm != 0 && !(fan::MIN_RPM..=fan::MAX_RPM).contains(&rpm) {
             bail!(
                 "RPM {rpm} out of range: use 0 (off) or {}-{}",
@@ -159,6 +176,12 @@ pub fn parse_points(s: &str) -> Result<Vec<(f64, u32)>> {
         points.push((temp, rpm));
     }
     points.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if points
+        .windows(2)
+        .any(|w| w[0].0 == w[1].0 || w[0].1 > w[1].1)
+    {
+        bail!("curve temperatures must be unique and RPM must not decrease with temperature");
+    }
     if points.is_empty() {
         bail!("curve needs at least one point");
     }
@@ -225,6 +248,20 @@ pub(crate) enum Decision {
     Hold,
     /// Target dropped, waiting out the down-delay before slowing.
     PendingDown,
+}
+
+/// Request a known cooling speed when real sensor access is lost.
+pub(crate) fn sensor_failure(pad: &Option<Pad>, dry_run: bool) -> Result<()> {
+    if dry_run {
+        log::warn!("sensor unavailable; would request 3000 RPM failsafe");
+        return Ok(());
+    }
+    let pad = pad
+        .as_ref()
+        .context("sensor unavailable and pad disconnected")?;
+    pad.send(&fan::set_rpm(3000))?;
+    log::warn!("sensor unavailable; requested 3000 RPM failsafe");
+    Ok(())
 }
 
 /// Decides when a computed target actually gets sent: hysteresis both ways,
@@ -306,6 +343,8 @@ pub(crate) struct TickOutcome {
 /// The per-tick control step shared by `curve` and `watch`: EMA smoothing,
 /// curve interpolation, device-range normalization, and governor gating.
 pub(crate) struct Controller {
+    gpu_points: Vec<(f64, u32)>,
+    gpu_floor: u32,
     points: Vec<(f64, u32)>,
     ema: Ema,
     governor: Governor,
@@ -314,6 +353,8 @@ pub(crate) struct Controller {
 impl Controller {
     pub(crate) fn new(points: Vec<(f64, u32)>, smooth: f64, down_delay: Duration) -> Self {
         Controller {
+            gpu_points: Vec::new(),
+            gpu_floor: 0,
             points,
             ema: Ema::new(smooth),
             governor: Governor::new(HYSTERESIS_RPM, down_delay),
@@ -324,7 +365,13 @@ impl Controller {
     /// tick; `now` is injected for testability.
     pub(crate) fn tick(&mut self, raw: f64, dt: f64, now: Instant) -> TickOutcome {
         let smoothed = self.ema.update(raw, dt);
-        let raw_target = target_rpm(&self.points, smoothed);
+        // Do not let smoothing delay the configured hottest-point response.
+        let control_temp = if raw >= self.points.last().unwrap().0 {
+            raw
+        } else {
+            smoothed
+        };
+        let raw_target = target_rpm(&self.points, control_temp).max(self.gpu_floor);
         // Below the device minimum means off.
         let target = if raw_target < fan::MIN_RPM {
             0
@@ -363,6 +410,24 @@ impl Controller {
 
 /// Live-tuning mutators, for adjusting the running curve interactively.
 impl Controller {
+    pub(crate) fn configure_gpu(&mut self, points: Vec<(f64, u32)>) {
+        self.gpu_points = points;
+    }
+
+    pub(crate) fn set_gpu_load(&mut self, percent: f64) -> Result<()> {
+        crate::gpu::validate_percent(percent)?;
+        if self.gpu_points.is_empty() {
+            bail!("GPU curve is not configured");
+        }
+        self.gpu_floor = target_rpm(&self.gpu_points, percent);
+        Ok(())
+    }
+
+    pub(crate) fn apply_pressure(&mut self, state: u8) {
+        if state >= 2 {
+            self.gpu_floor = self.gpu_floor.max(3000);
+        }
+    }
     /// Change the smoothing time constant without disturbing the current
     /// smoothed value: the line just starts converging faster or slower.
     pub(crate) fn set_smooth(&mut self, tau: f64) {
@@ -462,6 +527,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
         Duration::from_secs(s.down_delay),
     );
     let mut pending_reported = false;
+    controller.configure_gpu(s.gpu_points.clone());
     let mut last_status_log = Instant::now();
 
     while is_running() {
@@ -509,6 +575,14 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
             }
         }
 
+        // Probe liveness even when the target is unchanged.
+        if let Some(p) = &pad
+            && let Err(e) = p.read_report()
+        {
+            log::warn!("cooling pad disconnected: {e:#}");
+            pad = None;
+            controller.reset();
+        }
         // (Re)connect if needed, so the pad recovers from unplug/replug and
         // sleep/wake without restarting the process.
         if !args.dry_run && pad.is_none() {
@@ -540,17 +614,43 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
             }
         }
 
+        let gpu_result =
+            crate::gpu::read_percent().and_then(|p| crate::gpu::thermal_pressure().map(|s| (p, s)));
+        let (gpu_percent, pressure) = match gpu_result {
+            Ok(sample) => sample,
+            Err(e) => {
+                log::error!("GPU telemetry failed: {e:#}");
+                if let Err(e) = sensor_failure(&pad, args.dry_run) {
+                    log::error!("failsafe command failed: {e:#}");
+                    pad = None;
+                }
+                controller.reset_after_wake();
+                std::thread::sleep(Duration::from_secs(s.interval));
+                continue;
+            }
+        };
+        controller.set_gpu_load(gpu_percent)?;
+        controller.apply_pressure(pressure);
         match reader.read() {
             Ok(raw) if !raw.is_finite() => {
                 log::warn!("temperature read was not finite: {raw}");
+                if let Err(e) = sensor_failure(&pad, args.dry_run) {
+                    log::error!("failsafe command failed: {e:#}");
+                    pad = None;
+                }
+                controller.reset_after_wake();
             }
             Ok(raw) => {
                 let out = controller.tick(raw, s.interval as f64, Instant::now());
                 let (temp, target, decision) = (out.smoothed, out.target, out.decision);
                 let detail = if s.smooth > 0.0 {
-                    format!(" (raw {:.1}°C)", out.raw)
+                    format!(
+                        " (raw {:.1}°C, GPU {gpu_percent:.0}%, pressure {})",
+                        out.raw,
+                        crate::gpu::pressure_name(pressure)
+                    )
                 } else {
-                    String::new()
+                    format!(" (GPU {gpu_percent:.0}%)")
                 };
                 // Info only on decision changes + heartbeat; every poll at debug.
                 match decision {
@@ -590,7 +690,19 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                             p.send(&fan::set_rpm(target))
                         };
                         match result {
-                            Ok(()) => controller.confirm(target),
+                            Ok(()) => {
+                                controller.confirm(target);
+                                let delivery = if opts.verify {
+                                    "acknowledged"
+                                } else {
+                                    "sent without response verification"
+                                };
+                                log::info!(
+                                    "fan command {delivery}: {} | GPU {gpu_percent:.0}% | die {:.1}°C",
+                                    rpm_text(target),
+                                    out.raw
+                                );
+                            }
                             Err(e) => {
                                 log::warn!("failed to set fan: {e:#} — will reconnect");
                                 pad = None;
@@ -601,7 +713,14 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                     // the send is retried as soon as we reconnect.
                 }
             }
-            Err(e) => log::warn!("temperature read failed: {e:#}"),
+            Err(e) => {
+                log::warn!("temperature read failed: {e:#}");
+                if let Err(e) = sensor_failure(&pad, args.dry_run) {
+                    log::error!("failsafe command failed: {e:#}");
+                    pad = None;
+                }
+                controller.reset_after_wake();
+            }
         }
 
         // Sleep in small slices so signals exit promptly and sleep/wake
@@ -637,6 +756,94 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires the real Razer pad and no running padctl service"]
+    fn hardware_sensor_failure_requests_and_acknowledges_failsafe() {
+        let api = crate::device::api().unwrap();
+        let pad = Some(Pad::open(&api, &Selector::default(), OpenOpts { verify: true }).unwrap());
+        sensor_failure(&pad, false).unwrap();
+        let report = pad.as_ref().unwrap().read_report().unwrap();
+        let actual = fan::rpm_from_report(&report);
+        // Restore a moderate command even if the assertion would fail.
+        pad.as_ref().unwrap().send(&fan::set_rpm(1500)).unwrap();
+        assert_eq!(actual, Some(3000));
+    }
+
+    #[test]
+    fn serious_pressure_overrides_cool_idle_inputs() {
+        let mut c = Controller::new(
+            parse_points("45:1000,85:3000").unwrap(),
+            60.0,
+            Duration::from_secs(30),
+        );
+        c.configure_gpu(parse_points("0:1000,100:3000").unwrap());
+        c.set_gpu_load(0.0).unwrap();
+        c.apply_pressure(2);
+        assert_eq!(c.tick(40.0, 2.0, Instant::now()).target, 3000);
+        c.confirm(3000);
+        c.set_gpu_load(0.0).unwrap();
+        c.apply_pressure(0);
+        assert_eq!(
+            c.tick(40.0, 2.0, Instant::now()).decision,
+            Decision::PendingDown
+        );
+    }
+
+    #[test]
+    fn gpu_load_raises_floor_without_hiding_heat_and_delays_cooldown() {
+        let mut c = Controller::new(
+            parse_points("45:1000,85:3000").unwrap(),
+            0.0,
+            Duration::from_secs(30),
+        );
+        c.configure_gpu(parse_points("0:1000,50:2000,100:3000").unwrap());
+        let now = Instant::now();
+        c.set_gpu_load(0.0).unwrap();
+        assert_eq!(c.tick(40.0, 2.0, now).target, 1000);
+        c.confirm(1000);
+        c.set_gpu_load(100.0).unwrap();
+        let out = c.tick(40.0, 2.0, now);
+        assert_eq!(out.target, 3000);
+        assert_eq!(out.decision, Decision::Send);
+        c.confirm(3000);
+        c.set_gpu_load(0.0).unwrap();
+        assert_eq!(c.tick(85.0, 2.0, now).target, 3000);
+        assert_eq!(c.tick(40.0, 2.0, now).decision, Decision::PendingDown);
+        assert_eq!(
+            c.tick(40.0, 2.0, now + Duration::from_secs(31)).decision,
+            Decision::Send
+        );
+        assert!(c.set_gpu_load(f64::NAN).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_temperature_and_decreasing_curves() {
+        for text in [
+            "NaN:1500",
+            "inf:1500",
+            "-1:1500",
+            "60:1200,60:1800",
+            "50:2000,70:1000",
+        ] {
+            assert!(parse_points(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn hottest_point_bypasses_smoothing() {
+        let mut controller = Controller::new(
+            parse_points("50:800,85:3000").unwrap(),
+            60.0,
+            Duration::from_secs(30),
+        );
+        let now = Instant::now();
+        controller.tick(40.0, 1.0, now);
+        controller.confirm(800);
+        let out = controller.tick(85.0, 1.0, now + Duration::from_secs(1));
+        assert_eq!(out.target, 3000);
+        assert_eq!(out.decision, Decision::Send);
+    }
+
+    #[test]
     fn interpolates_and_clamps() {
         let points = parse_points("55:800,65:1500,75:2200,85:3200").unwrap();
         assert_eq!(target_rpm(&points, 40.0), 800); // clamp low
@@ -664,6 +871,7 @@ mod tests {
     #[test]
     fn resolve_precedence_cli_over_file_over_default() {
         let file = CurveConfig {
+            gpu_points: None,
             points: Some("50:0,70:2000".into()),
             interval: Some(10),
             on_exit: Some("keep".into()),

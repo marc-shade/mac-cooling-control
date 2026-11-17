@@ -98,6 +98,7 @@ fn plist_content(exe: &str, home: &str, log: &str) -> String {
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
+        <string>--verify</string>
         <string>curve</string>
     </array>
     <key>EnvironmentVariables</key>
