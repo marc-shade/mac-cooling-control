@@ -9,6 +9,12 @@ This project is derived from [Harold Martin's padctl](https://github.com/hbmarti
 The original MIT license and upstream history are retained. It is independent
 of Razer and Apple and does not change CPU/GPU power limits.
 
+## Contributors
+
+- [Marc Shade (@marc-shade)](https://github.com/marc-shade): project direction,
+  macOS requirements, and physical fan-response and USB-reconnect validation.
+- [Harold Martin (@hbmartin)](https://github.com/hbmartin): original padctl project.
+
 ## Hardware and behavior
 
 The control interface must appear as USB `1532:0f43`. A generic USB hub alone
@@ -54,6 +60,16 @@ validated machine.
 
 ## Automatic cooling
 
+Readings, dashboard charts and service logs use Fahrenheit by default. Use
+`--temperature-unit celsius` for Celsius displays, for example
+`padctl --temperature-unit celsius temp`. JSON includes a selected-unit value
+and `temperature_unit`, plus explicitly named Fahrenheit and Celsius fields.
+Existing Celsius JSON fields retain their original meaning.
+
+Saved temperature curves, `--points`, and thermal-lighting `--min`/`--max`
+remain explicitly Celsius. Dashboard curve edits use 1°C (1.8°F) steps and
+save Celsius values. Changing display units does not change cooling targets.
+
 Copy `config.example.toml` to `~/.config/padctl/config.toml` after checking for
 an existing configuration, or use `padctl config init` to create one without
 overwriting. Command-line options override the configuration.
@@ -71,11 +87,11 @@ The example configuration uses these targets:
 
 | Die temperature | RPM | GPU use | RPM |
 |---|---:|---|---:|
-| 45°C | 1000 | 0% | 1000 |
-| 55°C | 1400 | 20% | 1400 |
-| 65°C | 2000 | 50% | 2000 |
-| 75°C | 2600 | 80% | 2600 |
-| 85°C | 3000 | 100% | 3000 |
+| 113°F (45°C) | 1000 | 0% | 1000 |
+| 131°F (55°C) | 1400 | 20% | 1400 |
+| 149°F (65°C) | 2000 | 50% | 2000 |
+| 167°F (75°C) | 2600 | 80% | 2600 |
+| 185°F (85°C) | 3000 | 100% | 3000 |
 
 Targets interpolate between points. The example polls every two seconds,
 uses five-second temperature smoothing and a 30-second downward delay.

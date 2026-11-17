@@ -6,6 +6,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use padctl::device::{self, OpenOpts, Pad, Selector};
 use padctl::packet::{self, PACKET_LEN, REPORT_LEN};
 use padctl::parse::{self, Speed};
+use padctl::temp::units;
 use padctl::{config, curve, doctor, fan, lighting, logging, reactive, rgb, service, temp, watch};
 
 #[derive(Parser)]
@@ -15,6 +16,10 @@ use padctl::{config, curve, doctor, fan, lighting, logging, reactive, rgb, servi
     version
 )]
 struct Cli {
+    /// Display temperature unit; saved curves and temperature input flags remain Celsius
+    #[arg(long, global = true, value_enum, default_value = "fahrenheit")]
+    temperature_unit: units::Unit,
+
     /// Debug logging: raw packets sent/received, every curve poll
     #[arg(short, long, global = true)]
     verbose: bool,
@@ -214,6 +219,7 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    units::set(cli.temperature_unit);
     // The watch TUI owns the terminal: a stderr logger would draw over the
     // alternate screen, so leave the log facade uninitialized (no-op) and
     // let the dashboard record events itself.
@@ -225,8 +231,12 @@ fn run(cli: Cli) -> Result<()> {
     match &cli.cmd {
         Cmd::Telemetry => {
             let reader = temp::TempReader::new()?;
+            let celsius = reader.read()?;
             return print_json(&serde_json::json!({
-                "die_celsius": reader.read()?, "temperature_source": reader.source_name(),
+                "die_temperature": units::value(celsius),
+                "temperature_unit": units::current().name(),
+                "die_fahrenheit": units::Unit::Fahrenheit.convert(celsius),
+                "die_celsius": celsius, "temperature_source": reader.source_name(),
                 "gpu_percent": padctl::gpu::read_percent()?,
                 "thermal_pressure": padctl::gpu::pressure_name(padctl::gpu::thermal_pressure()?),
                 "gpu_source": "IOKit AGXAccelerator Device Utilization %"
@@ -255,11 +265,14 @@ fn run(cli: Cli) -> Result<()> {
             let celsius = reader.read()?;
             if *json {
                 print_json(&serde_json::json!({
+                    "temperature": units::value(celsius),
+                    "temperature_unit": units::current().name(),
+                    "fahrenheit": units::Unit::Fahrenheit.convert(celsius),
                     "celsius": celsius,
                     "source": reader.source_name(),
                 }))?;
             } else {
-                println!("{celsius:.1}°C ({})", reader.source_name());
+                println!("{} ({})", units::display(celsius), reader.source_name());
             }
             return Ok(());
         }
@@ -274,16 +287,23 @@ fn run(cli: Cli) -> Result<()> {
             if *json {
                 let rows: Vec<serde_json::Value> = sensors
                     .iter()
-                    .map(|r| serde_json::json!({ "name": r.name, "celsius": r.celsius }))
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r.name, "celsius": r.celsius,
+                            "fahrenheit": units::Unit::Fahrenheit.convert(r.celsius),
+                            "temperature": units::value(r.celsius),
+                        })
+                    })
                     .collect();
                 print_json(&serde_json::json!({
                     "source": reader.source_name(),
+                    "temperature_unit": units::current().name(),
                     "sensors": rows,
                 }))?;
             } else {
                 println!("source: {}", reader.source_name());
                 for r in sensors {
-                    println!("{:6.1}°C  {}", r.celsius, r.name);
+                    println!("{:>8}  {}", units::display(r.celsius), r.name);
                 }
             }
             return Ok(());
@@ -315,7 +335,15 @@ fn run(cli: Cli) -> Result<()> {
                         &curve::CurveArgs::default(),
                         file.as_ref().map(|c| &c.curve),
                     )?;
-                    println!("curve points: {}", s.points_text);
+                    println!("curve points (Celsius config): {}", s.points_text);
+                    println!(
+                        "display curve: {}",
+                        s.points
+                            .iter()
+                            .map(|&(t, rpm)| format!("{}:{rpm}", units::display(t)))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
                     println!(
                         "GPU points:   {}",
                         s.gpu_points
@@ -521,6 +549,9 @@ fn run(cli: Cli) -> Result<()> {
                     "firmware": format!("{}.{}", fw.args[0], fw.args[1]),
                     "serial": rgb::serial_text(&serial),
                     "die_temp_celsius": celsius,
+                    "die_temp_fahrenheit": celsius.map(|t| units::Unit::Fahrenheit.convert(t)),
+                    "die_temperature": celsius.map(units::value),
+                    "temperature_unit": units::current().name(),
                     "temp_source": source,
                 }))?;
             } else {
@@ -535,7 +566,7 @@ fn run(cli: Cli) -> Result<()> {
                 println!("firmware:   v{}.{}", fw.args[0], fw.args[1]);
                 println!("serial:     {}", rgb::serial_text(&serial));
                 match temp {
-                    Ok((t, source)) => println!("die temp:   {t:.1}°C ({source})"),
+                    Ok((t, source)) => println!("die temp:   {} ({source})", units::display(t)),
                     Err(e) => println!("die temp:   unavailable ({e:#})"),
                 }
             }

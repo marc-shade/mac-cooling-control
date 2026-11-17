@@ -260,7 +260,8 @@ fn temperature_check() -> Check {
                 Check::warn(
                     "temperature",
                     format!(
-                        "{celsius:.1}°C via {} — coarse estimates only",
+                        "{} via {} (coarse estimates only)",
+                        crate::temp::units::display(celsius),
                         reader.source_name()
                     ),
                     "the fan curve still works but reacts in big steps; real \
@@ -269,7 +270,11 @@ fn temperature_check() -> Check {
             } else {
                 Check::pass(
                     "temperature",
-                    format!("{celsius:.1}°C via {}", reader.source_name()),
+                    format!(
+                        "{} via {}",
+                        crate::temp::units::display(celsius),
+                        reader.source_name()
+                    ),
                 )
             }
         }

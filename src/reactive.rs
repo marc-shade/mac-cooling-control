@@ -89,9 +89,9 @@ pub fn run(pad: Pad, args: ThermalArgs) -> Result<()> {
     let interval = args.interval.max(1);
     let reader = TempReader::new()?;
     println!(
-        "thermal lighting: {}..{}°C, {:?} style | temp source: {} | Ctrl-C to stop",
-        args.min,
-        args.max,
+        "thermal lighting: {}..{}, {:?} style | temp source: {} | Ctrl-C to stop",
+        crate::temp::units::display(args.min),
+        crate::temp::units::display(args.max),
         args.style,
         reader.source_name()
     );
@@ -117,7 +117,7 @@ pub fn run(pad: Pad, args: ThermalArgs) -> Result<()> {
                     Style::Solid => vec![rgb::temp_color(frac); rgb::NUM_LEDS],
                 };
                 if last_frame.as_ref() != Some(&frame) {
-                    log::debug!("{temp:5.1}°C -> frame update");
+                    log::debug!("{} -> frame update", crate::temp::units::display(temp));
                     pad.send(&rgb::custom_frame(0, &frame))?;
                     pad.send(&rgb::custom_apply())?;
                     last_frame = Some(frame);

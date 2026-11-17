@@ -16,6 +16,7 @@ mod linux;
 use linux as imp;
 
 use anyhow::Result;
+pub mod units;
 
 /// A single named temperature sensor reading, for `padctl sensors`.
 pub struct Reading {

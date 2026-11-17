@@ -84,6 +84,20 @@ service held the pad. The terminal dashboard was rendered in cmux with real
 temperature/GPU data in dry-run mode. Pause and quit were exercised. Dashboard
 edits during inspection were not saved to the service configuration.
 
+## Fahrenheit display update
+
+The default display now uses Fahrenheit, with a `--temperature-unit celsius`
+override. `cargo test --locked` passed 85 unit and 16 property tests; clippy,
+formatting and the release build exited 0. Live `temp`, `sensors`, `telemetry`,
+`status` and `doctor` outputs were checked. JSON assertions passed for default
+Fahrenheit and explicit Celsius, including consistent conversion within the
+same sensor sample. Existing Celsius JSON fields retain their original units.
+
+The installed service logged an acknowledged 1500 RPM command at 133.3°F.
+The dashboard was visually checked with Fahrenheit tiles, chart axes, curve
+points and decision text. Saved thresholds and control calculations remain
+Celsius; the installed curve was unchanged.
+
 ## Gaps / not covered
 
 - Sleep/wake and reboot/login recovery were not executed because the user

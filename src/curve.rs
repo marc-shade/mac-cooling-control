@@ -21,6 +21,7 @@ use crate::device::{OpenOpts, Pad, Selector};
 use crate::fan;
 use crate::power;
 use crate::temp::TempReader;
+use crate::temp::units;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OnExit {
@@ -488,7 +489,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
         "fan curve: {} | temp source: {} | poll {}s | smooth {}s | down-delay {}s{}{}",
         s.points
             .iter()
-            .map(|(t, r)| format!("{t}°C→{r}"))
+            .map(|(t, r)| format!("{}→{r}", units::display(*t)))
             .collect::<Vec<_>>()
             .join(", "),
         reader.source_name(),
@@ -645,8 +646,8 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                 let (temp, target, decision) = (out.smoothed, out.target, out.decision);
                 let detail = if s.smooth > 0.0 {
                     format!(
-                        " (raw {:.1}°C, GPU {gpu_percent:.0}%, pressure {})",
-                        out.raw,
+                        " (raw {}, GPU {gpu_percent:.0}%, pressure {})",
+                        units::display(out.raw),
                         crate::gpu::pressure_name(pressure)
                     )
                 } else {
@@ -655,12 +656,16 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                 // Info only on decision changes + heartbeat; every poll at debug.
                 match decision {
                     Decision::Send => {
-                        log::info!("{temp:5.1}°C -> {}{detail}", rpm_text(target));
+                        log::info!("{} -> {}{detail}", units::display(temp), rpm_text(target));
                         pending_reported = false;
                         last_status_log = Instant::now();
                     }
                     Decision::PendingDown if !pending_reported => {
-                        log::info!("{temp:5.1}°C .. {} (down pending)", rpm_text(target));
+                        log::info!(
+                            "{} .. {} (down pending)",
+                            units::display(temp),
+                            rpm_text(target)
+                        );
                         pending_reported = true;
                         last_status_log = Instant::now();
                     }
@@ -670,12 +675,13 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                         }
                         if last_status_log.elapsed() >= HEARTBEAT {
                             log::info!(
-                                "{temp:5.1}°C, fan {} (heartbeat)",
+                                "{}, fan {} (heartbeat)",
+                                units::display(temp),
                                 rpm_text(controller.applied().unwrap_or(target)),
                             );
                             last_status_log = Instant::now();
                         } else {
-                            log::debug!("{temp:5.1}°C    {}{detail}", rpm_text(target));
+                            log::debug!("{}    {}{detail}", units::display(temp), rpm_text(target));
                         }
                     }
                 }
@@ -698,9 +704,9 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                                     "sent without response verification"
                                 };
                                 log::info!(
-                                    "fan command {delivery}: {} | GPU {gpu_percent:.0}% | die {:.1}°C",
+                                    "fan command {delivery}: {} | GPU {gpu_percent:.0}% | die {}",
                                     rpm_text(target),
-                                    out.raw
+                                    units::display(out.raw)
                                 );
                             }
                             Err(e) => {

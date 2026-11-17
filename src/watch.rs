@@ -31,6 +31,7 @@ use crate::device::{OpenOpts, Pad, Selector};
 use crate::fan;
 use crate::lighting;
 use crate::temp::TempReader;
+use crate::temp::units;
 
 /// Samples kept for the history charts (1 hour at the default 5s interval).
 const HISTORY_CAP: usize = 720;
@@ -309,7 +310,7 @@ impl<'a> App<'a> {
 
         let out = self.controller.tick(raw, dt, now);
         let detail = if self.controller.smooth() > 0.0 {
-            format!(" (raw {:.1}°C)", out.raw)
+            format!(" (raw {})", units::display(out.raw))
         } else {
             String::new()
         };
@@ -317,7 +318,11 @@ impl<'a> App<'a> {
             Decision::Send => {
                 self.push_event(
                     EventKind::Send,
-                    format!("{:5.1}°C → {}{detail}", out.smoothed, rpm_text(out.target)),
+                    format!(
+                        "{} → {}{detail}",
+                        units::display(out.smoothed),
+                        rpm_text(out.target)
+                    ),
                 );
                 self.pending_reported = false;
                 self.pending_since = None;
@@ -327,8 +332,8 @@ impl<'a> App<'a> {
                     self.push_event(
                         EventKind::PendingDown,
                         format!(
-                            "{:5.1}°C ‥ {} (down pending)",
-                            out.smoothed,
+                            "{} ‥ {} (down pending)",
+                            units::display(out.smoothed),
                             rpm_text(out.target)
                         ),
                     );
@@ -342,7 +347,11 @@ impl<'a> App<'a> {
                 if self.verbose {
                     self.push_event(
                         EventKind::Poll,
-                        format!("{:5.1}°C    {}{detail}", out.smoothed, rpm_text(out.target)),
+                        format!(
+                            "{}    {}{detail}",
+                            units::display(out.smoothed),
+                            rpm_text(out.target)
+                        ),
                     );
                 }
             }
@@ -442,7 +451,10 @@ impl<'a> App<'a> {
                 let mut points = self.controller.points().to_vec();
                 if adjust_rpm(&mut points, self.selected, dir > 0) {
                     let (t, r) = points[self.selected];
-                    self.push_event(EventKind::Info, format!("point {t}°C → {}", rpm_text(r)));
+                    self.push_event(
+                        EventKind::Info,
+                        format!("point {} → {}", units::display(t), rpm_text(r)),
+                    );
                     self.controller.set_points(points);
                     self.dirty = true;
                 }
@@ -454,7 +466,7 @@ impl<'a> App<'a> {
                     let (t, r) = points[self.selected];
                     self.push_event(
                         EventKind::Info,
-                        format!("point {} moved to {t}°C", rpm_text(r)),
+                        format!("point {} moved to {}", rpm_text(r), units::display(t)),
                     );
                     self.controller.set_points(points);
                     self.dirty = true;
@@ -684,7 +696,7 @@ fn draw_tiles(f: &mut Frame, app: &App, area: Rect) {
     ])
     .areas(area);
     let last = app.history.back();
-    let fmt_temp = |v: Option<f64>| v.map_or("—".into(), |v| format!("{v:.1}°C"));
+    let fmt_temp = |v: Option<f64>| v.map_or("unavailable".into(), units::display);
     f.render_widget(tile("raw", fmt_temp(last.map(|s| s.raw)), RAW_COLOR), raw);
     f.render_widget(
         tile(
@@ -737,15 +749,17 @@ fn time_bounds(app: &App) -> [f64; 2] {
 }
 
 fn draw_temp_chart(f: &mut Frame, app: &App, area: Rect) {
-    let raw: Vec<(f64, f64)> = window(app).map(|s| (s.t, s.raw)).collect();
-    let smoothed: Vec<(f64, f64)> = window(app).map(|s| (s.t, s.smoothed)).collect();
+    let raw: Vec<(f64, f64)> = window(app).map(|s| (s.t, units::value(s.raw))).collect();
+    let smoothed: Vec<(f64, f64)> = window(app)
+        .map(|s| (s.t, units::value(s.smoothed)))
+        .collect();
     let (mut lo, mut hi) = (f64::MAX, f64::MIN);
     for &(_, v) in raw.iter().chain(&smoothed) {
         lo = lo.min(v);
         hi = hi.max(v);
     }
     if lo > hi {
-        (lo, hi) = (30.0, 90.0);
+        (lo, hi) = (units::value(30.0), units::value(90.0));
     }
     let (lo, hi) = ((lo - 2.0).floor(), (hi + 2.0).ceil());
     let datasets = vec![
@@ -763,7 +777,7 @@ fn draw_temp_chart(f: &mut Frame, app: &App, area: Rect) {
             .data(&smoothed),
     ];
     let chart = Chart::new(datasets)
-        .block(Block::bordered().title("temperature °C"))
+        .block(Block::bordered().title(format!("temperature {}", units::current().symbol())))
         .x_axis(Axis::default().bounds(time_bounds(app)))
         .y_axis(
             Axis::default()
@@ -809,16 +823,19 @@ fn draw_curve_panel(f: &mut Frame, app: &App, area: Rect) {
         Layout::vertical([Constraint::Fill(1), Constraint::Length(points.len() as u16)])
             .areas(area);
 
-    let curve: Vec<(f64, f64)> = points.iter().map(|&(t, r)| (t, f64::from(r))).collect();
+    let curve: Vec<(f64, f64)> = points
+        .iter()
+        .map(|&(t, r)| (units::value(t), f64::from(r)))
+        .collect();
     let selected = [curve[app.selected.min(curve.len() - 1)]];
     let operating: Vec<(f64, f64)> = app
         .history
         .back()
-        .map(|s| (s.smoothed, f64::from(s.target)))
+        .map(|s| (units::value(s.smoothed), f64::from(s.target)))
         .into_iter()
         .collect();
-    let x_lo = (points.first().map_or(40.0, |p| p.0) - 5.0).floor();
-    let x_hi = (points.last().map_or(100.0, |p| p.0) + 5.0).ceil();
+    let x_lo = units::value(points.first().map_or(40.0, |p| p.0) - 5.0).floor();
+    let x_hi = units::value(points.last().map_or(100.0, |p| p.0) + 5.0).ceil();
     let datasets = vec![
         Dataset::default()
             .marker(symbols::Marker::Braille)
@@ -836,11 +853,10 @@ fn draw_curve_panel(f: &mut Frame, app: &App, area: Rect) {
     ];
     let chart = Chart::new(datasets)
         .block(Block::bordered().title("curve (Tab select, ←→↑↓ edit)"))
-        .x_axis(
-            Axis::default()
-                .bounds([x_lo, x_hi])
-                .labels([format!("{x_lo:.0}°C"), format!("{x_hi:.0}°C")]),
-        )
+        .x_axis(Axis::default().bounds([x_lo, x_hi]).labels([
+            format!("{x_lo:.0}{}", units::current().symbol()),
+            format!("{x_hi:.0}{}", units::current().symbol()),
+        ]))
         .y_axis(Axis::default().bounds([0.0, f64::from(fan::MAX_RPM) + 100.0]));
     f.render_widget(chart, chart_area);
 
@@ -855,7 +871,7 @@ fn draw_curve_panel(f: &mut Frame, app: &App, area: Rect) {
                 Style::new()
             };
             ListItem::new(Line::from(Span::styled(
-                format!("{marker} {t:>5.1}°C : {}", rpm_text(r)),
+                format!("{marker} {:>7} : {}", units::display(t), rpm_text(r)),
                 style,
             )))
         })
