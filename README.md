@@ -9,6 +9,9 @@ This project is derived from [Harold Martin's padctl](https://github.com/hbmarti
 The original MIT license and upstream history are retained. It is independent
 of Razer and Apple and does not change CPU/GPU power limits.
 
+The login service also supplies a live monitoring feed to the
+[XRG cooling overview](docs/XRG.md), alongside XRG's measured Mac fan speeds.
+
 ## Contributors
 
 - [Marc Shade (@marc-shade)](https://github.com/marc-shade): project direction,

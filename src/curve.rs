@@ -530,6 +530,18 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
     let mut pending_reported = false;
     controller.configure_gpu(s.gpu_points.clone());
     let mut last_status_log = Instant::now();
+    let publisher = if args.dry_run {
+        None
+    } else {
+        match crate::status::Publisher::new() {
+            Ok(publisher) => Some(publisher),
+            Err(error) => {
+                log::error!("XRG monitoring unavailable: {error:#}");
+                None
+            }
+        }
+    };
+    let mut snapshot = crate::status::Snapshot::new(s.interval);
 
     while is_running() {
         if let Some(mon) = power.as_mut() {
@@ -569,6 +581,10 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                 }
             }
             if mon.is_asleep() {
+                snapshot.connected = false;
+                snapshot.fan_commanded_rpm = None;
+                snapshot.error = Some("Mac is sleeping".into());
+                crate::status::publish(&publisher, &mut snapshot);
                 // Nothing useful to do until wake; check again shortly so
                 // the wake is handled promptly.
                 std::thread::sleep(Duration::from_millis(200));
@@ -615,16 +631,30 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
             }
         }
 
+        snapshot = crate::status::Snapshot::new(s.interval);
+        snapshot.connected = pad.is_some();
+        snapshot.fan_commanded_rpm = if snapshot.connected && opts.verify {
+            controller.applied()
+        } else {
+            None
+        };
         let gpu_result =
             crate::gpu::read_percent().and_then(|p| crate::gpu::thermal_pressure().map(|s| (p, s)));
         let (gpu_percent, pressure) = match gpu_result {
             Ok(sample) => sample,
             Err(e) => {
                 log::error!("GPU telemetry failed: {e:#}");
-                if let Err(e) = sensor_failure(&pad, args.dry_run) {
-                    log::error!("failsafe command failed: {e:#}");
-                    pad = None;
+                snapshot.error = Some(format!("GPU telemetry failed: {e:#}"));
+                match sensor_failure(&pad, args.dry_run) {
+                    Ok(()) => snapshot.fan_commanded_rpm = opts.verify.then_some(3000),
+                    Err(e) => {
+                        log::error!("failsafe command failed: {e:#}");
+                        pad = None;
+                        snapshot.connected = false;
+                        snapshot.fan_commanded_rpm = None;
+                    }
                 }
+                crate::status::publish(&publisher, &mut snapshot);
                 controller.reset_after_wake();
                 std::thread::sleep(Duration::from_secs(s.interval));
                 continue;
@@ -632,16 +662,23 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
         };
         controller.set_gpu_load(gpu_percent)?;
         controller.apply_pressure(pressure);
+        snapshot.gpu_percent = Some(gpu_percent);
+        snapshot.thermal_pressure = Some(crate::gpu::pressure_name(pressure));
         match reader.read() {
             Ok(raw) if !raw.is_finite() => {
+                snapshot.error = Some("temperature read was not finite".into());
                 log::warn!("temperature read was not finite: {raw}");
                 if let Err(e) = sensor_failure(&pad, args.dry_run) {
                     log::error!("failsafe command failed: {e:#}");
                     pad = None;
+                    snapshot.fan_commanded_rpm = None;
+                } else {
+                    snapshot.fan_commanded_rpm = opts.verify.then_some(3000);
                 }
                 controller.reset_after_wake();
             }
             Ok(raw) => {
+                snapshot.set_temperature(raw);
                 let out = controller.tick(raw, s.interval as f64, Instant::now());
                 let (temp, target, decision) = (out.smoothed, out.target, out.decision);
                 let detail = if s.smooth > 0.0 {
@@ -698,6 +735,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                         match result {
                             Ok(()) => {
                                 controller.confirm(target);
+                                snapshot.fan_commanded_rpm = opts.verify.then_some(target);
                                 let delivery = if opts.verify {
                                     "acknowledged"
                                 } else {
@@ -710,6 +748,8 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                                 );
                             }
                             Err(e) => {
+                                snapshot.error = Some(format!("fan command failed: {e:#}"));
+                                snapshot.fan_commanded_rpm = None;
                                 log::warn!("failed to set fan: {e:#} — will reconnect");
                                 pad = None;
                             }
@@ -720,15 +760,21 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                 }
             }
             Err(e) => {
+                snapshot.error = Some(format!("temperature read failed: {e:#}"));
                 log::warn!("temperature read failed: {e:#}");
                 if let Err(e) = sensor_failure(&pad, args.dry_run) {
                     log::error!("failsafe command failed: {e:#}");
                     pad = None;
+                    snapshot.fan_commanded_rpm = None;
+                } else {
+                    snapshot.fan_commanded_rpm = opts.verify.then_some(3000);
                 }
                 controller.reset_after_wake();
             }
         }
 
+        snapshot.connected = pad.is_some();
+        crate::status::publish(&publisher, &mut snapshot);
         // Sleep in small slices so signals exit promptly and sleep/wake
         // transitions are handled without waiting out the poll interval.
         let mut remaining = s.interval.saturating_mul(10);
@@ -746,14 +792,23 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
             }
             match &pad {
                 Some(p) => match p.send(&fan::off()) {
-                    Ok(()) => log::info!("fan off"),
-                    Err(e) => log::warn!("failed to turn the fan off: {e:#}"),
+                    Ok(()) => {
+                        snapshot.fan_commanded_rpm = opts.verify.then_some(0);
+                        log::info!("fan off");
+                    }
+                    Err(e) => {
+                        snapshot.fan_commanded_rpm = None;
+                        snapshot.error = Some(format!("failed to turn the fan off: {e:#}"));
+                        log::warn!("failed to turn the fan off: {e:#}");
+                    }
                 },
                 None => log::warn!("pad unavailable, could not turn the fan off"),
             }
         }
         _ => log::info!("leaving fan as-is"),
     }
+    snapshot.running = false;
+    crate::status::publish(&publisher, &mut snapshot);
     Ok(())
 }
 

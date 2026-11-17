@@ -23,5 +23,6 @@ pub mod power;
 pub mod reactive;
 pub mod rgb;
 pub mod service;
+pub mod status;
 pub mod temp;
 pub mod watch;
