@@ -160,19 +160,40 @@ fn install() -> Result<()> {
     .with_context(|| format!("writing {}", plist.display()))?;
 
     let uid = uid()?;
-    // Reload cleanly if a previous version is running.
-    let _ = launchctl(&["bootout", &format!("gui/{uid}/{LABEL}")]);
-    let boot = launchctl(&["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()])?;
-    if !boot.status.success() {
-        // Older macOS fallback.
-        let load = launchctl(&["load", "-w", &plist.to_string_lossy()])?;
-        if !load.status.success() {
+    // Do not hide a failed modern bootstrap behind legacy `load`, which can
+    // exit successfully without leaving this GUI-domain agent loaded.
+    if agent_runtime()?.is_some() {
+        let stop = launchctl(&["bootout", &format!("gui/{uid}/{LABEL}")])?;
+        if !stop.status.success() {
             bail!(
-                "launchctl could not load the agent:\n{}{}",
-                String::from_utf8_lossy(&boot.stderr),
-                String::from_utf8_lossy(&load.stderr)
+                "launchctl could not stop the existing agent: {}",
+                String::from_utf8_lossy(&stop.stderr)
             );
         }
+        for _ in 0..20 {
+            if agent_runtime()?.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if agent_runtime()?.is_some() {
+            bail!("existing launch agent did not unload; refusing to report a successful install");
+        }
+    }
+    let boot = launchctl(&["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()])?;
+    if !boot.status.success() {
+        bail!(
+            "launchctl could not bootstrap the agent ({}): {}",
+            boot.status,
+            String::from_utf8_lossy(&boot.stderr)
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    if agent_runtime()?.is_none() {
+        bail!(
+            "launchctl returned success but the agent is not loaded; inspect {}",
+            log.display()
+        );
     }
 
     println!("installed launch agent {LABEL}");

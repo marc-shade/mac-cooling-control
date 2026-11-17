@@ -69,6 +69,13 @@ crash recovery. Launchd started a new process, and the log recorded an
 acknowledged 1350 RPM command at 13:45:55. This checks process recovery without
 sleeping or rebooting the computer.
 
+A subsequent installation check found the inherited legacy `launchctl load`
+fallback could report success while the GUI-domain agent was not loaded.
+The installer now reports bootstrap errors directly, waits for an existing
+agent to unload, and verifies registration after bootstrap. Three consecutive
+install/reload operations then exited 0 with a running process each time;
+the final process logged an acknowledged 1550 RPM command at 13:48:49.
+
 The user heard a physical fan change during the earlier 1000/3000 RPM test.
 This is a manual observation, not a calibrated speed measurement.
 
