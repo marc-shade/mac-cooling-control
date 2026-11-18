@@ -14,6 +14,77 @@ pub struct Plan {
     pub packets: Vec<Packet>,
     /// Human-readable description, e.g. `brightness 80%, static #ff6600`.
     pub summary: String,
+    pub fan_status: bool,
+    applied: Option<Band>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Band {
+    Off,
+    Blue,
+    Amber,
+    Red,
+}
+
+impl Band {
+    fn for_rpm(rpm: u32) -> Self {
+        match rpm {
+            0 => Self::Off,
+            1..1500 => Self::Blue,
+            1500..3000 => Self::Amber,
+            _ => Self::Red,
+        }
+    }
+
+    fn effect(self) -> (&'static str, Packet) {
+        match self {
+            Self::Off => ("off", rgb::off()),
+            Self::Blue => ("blue", rgb::static_color(0, 0, 255)),
+            Self::Amber => ("amber", rgb::static_color(255, 160, 0)),
+            Self::Red => ("red", rgb::static_color(255, 0, 0)),
+        }
+    }
+}
+
+impl Plan {
+    pub fn connect(&mut self, pad: &crate::device::Pad) -> Result<()> {
+        self.applied = None;
+        if !self.fan_status {
+            self.packets
+                .iter()
+                .try_for_each(|packet| pad.send(packet))?;
+        }
+        Ok(())
+    }
+}
+
+/// Called only with an acknowledged fan command. A failed LED write is
+/// retried on the next poll without disturbing the fan governor.
+pub fn sync_status(
+    plan: Option<&mut Plan>,
+    pad: Option<&crate::device::Pad>,
+    acknowledged_rpm: Option<u32>,
+) -> Result<Option<&'static str>> {
+    let Some(plan) = plan.filter(|p| p.fan_status) else {
+        return Ok(None);
+    };
+    let (Some(pad), Some(rpm)) = (pad, acknowledged_rpm) else {
+        plan.applied = None;
+        return Ok(None);
+    };
+    let band = Band::for_rpm(rpm);
+    let (name, packet) = band.effect();
+    if plan.applied != Some(band) {
+        // An interrupted transaction leaves the strip state unknown.
+        let first_write = plan.applied.take().is_none();
+        if first_write {
+            plan.packets.iter().try_for_each(|p| pad.send(p))?;
+        }
+        pad.send(&packet)?;
+        plan.applied = Some(band);
+        log::info!("status light acknowledged: {name} for {rpm} RPM");
+    }
+    Ok(Some(name))
 }
 
 /// Validate `cfg` and build the packets it describes. `Ok(None)` means the
@@ -53,6 +124,10 @@ pub fn plan(cfg: &LightingConfig) -> Result<Option<Plan>> {
             if !colors.is_empty() {
                 bail!("lighting colors need an effect (e.g. effect = \"static\")");
             }
+        }
+        Some("fan-status") => {
+            expect_colors(&colors, 0, "fan-status")?;
+            parts.push("fan status (acknowledged RPM)".into());
         }
         Some("off") => {
             expect_colors(&colors, 0, "off")?;
@@ -117,16 +192,18 @@ pub fn plan(cfg: &LightingConfig) -> Result<Option<Plan>> {
         }
         Some(other) => bail!(
             "unknown lighting effect {other:?}: use off, static, spectrum, wave, \
-             breath, gradient or custom"
+             breath, gradient, custom or fan-status"
         ),
     }
 
-    if packets.is_empty() {
+    if parts.is_empty() {
         return Ok(None);
     }
     Ok(Some(Plan {
         packets,
         summary: parts.join(", "),
+        fan_status: effect == Some("fan-status"),
+        applied: None,
     }))
 }
 

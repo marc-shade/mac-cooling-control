@@ -257,6 +257,15 @@ impl Pad {
                     if resp.class == 0x0d && report[9..13] != sent[9..13] {
                         bail!("verify: fan acknowledgement contains a different command value");
                     }
+                    if resp.class == 0x0f
+                        && resp.cmd == 0x02
+                        && matches!(sent[11], 0 | 1)
+                        && report[9..18] != sent[9..18]
+                    {
+                        bail!(
+                            "verify: lighting acknowledgement contains a different effect or color"
+                        );
+                    }
                     return Ok(());
                 }
                 Status::Busy => continue,
@@ -456,6 +465,49 @@ mod tests {
         let cmd = rgb::spectrum();
         mock.script_read(echo(&cmd, 0x02));
         mock.pad(true).send(&cmd).unwrap();
+    }
+
+    #[test]
+    fn status_light_requires_fan_ack_and_retries_changed_or_rejected_color() {
+        use crate::lighting::{plan, sync_status};
+        let config = crate::config::parse(include_str!("../config.mac-fans.toml")).unwrap();
+        let mut plan = plan(&config.lighting).unwrap().unwrap();
+        let mock = Mock::default();
+        let pad = mock.pad(true);
+        plan.connect(&pad).unwrap();
+        assert_eq!(
+            sync_status(Some(&mut plan), Some(&pad), None).unwrap(),
+            None
+        );
+        assert_eq!(mock.sent_count(), 0);
+        let brightness = rgb::brightness_set(89);
+        let blue = rgb::static_color(0, 0, 255);
+        let amber = rgb::static_color(255, 160, 0);
+        mock.script_read(echo(&brightness, 2));
+        mock.script_read(echo(&blue, 2));
+        let mut update = |rpm| sync_status(Some(&mut plan), Some(&pad), Some(rpm));
+        assert_eq!(update(500).unwrap(), Some("blue"));
+        assert_eq!(update(1450).unwrap(), Some("blue"));
+        assert_eq!(mock.sent_count(), 2);
+        mock.script_read(echo(&blue, 2));
+        assert!(update(1500).is_err());
+        mock.script_read(echo(&brightness, 2));
+        mock.script_read(echo(&amber, 3));
+        assert!(update(1500).is_err());
+        mock.script_read(echo(&brightness, 2));
+        mock.script_read(echo(&amber, 2));
+        assert_eq!(update(2950).unwrap(), Some("amber"));
+        mock.script_read(echo(&rgb::static_color(255, 0, 0), 2));
+        assert_eq!(update(3000).unwrap(), Some("red"));
+        mock.script_read(echo(&rgb::off(), 2));
+        assert_eq!(update(0).unwrap(), Some("off"));
+        plan.connect(&pad).unwrap();
+        mock.script_read(echo(&brightness, 2));
+        mock.script_read(echo(&rgb::off(), 2));
+        assert_eq!(
+            sync_status(Some(&mut plan), Some(&pad), Some(0)).unwrap(),
+            Some("off")
+        );
     }
 
     #[test]

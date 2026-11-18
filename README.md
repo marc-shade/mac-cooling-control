@@ -101,6 +101,29 @@ uses five-second temperature smoothing and a 30-second downward delay.
 `on_exit = "keep"` keeps the fan running at its last command when stopped
 or asleep. These settings are configurable and are not universal thermal limits.
 
+### Follow the MacBook Pro's internal fans
+
+Use `config.mac-fans.toml` for a quieter fan-led profile. The controller reads
+the actual speed of each internal fan from AppleSMC and uses the fastest.
+The first positive reading from either Mac fan starts the pad at a minimum
+of 500 RPM. The fan curve holds 500 through 1800 internal RPM, then ramps to
+1000 at 2500, 1800 at 3500 and 3000 at 5000 internal RPM. A lower target must persist
+for 30 seconds. GPU spikes alone leave the pad off. The independent temperature
+curve ramps from 75°C to 85°C, and serious or critical thermal pressure still
+requests 3000 RPM. Missing required fan readings use the telemetry failsafe.
+
+`padctl telemetry` reports individual tachometers in `mac_fans_rpm` and any
+read error in `mac_fans_error`. The service publishes the same RPM array in
+`status.json` while following the fan curve and includes it in decision logs.
+The profile also enables `[lighting]` with `effect = "fan-status"` and
+35% brightness. In automatic mode the strip is dark at 0 commanded RPM,
+blue below 1500 RPM, amber from 1500 through 2950 RPM, and red at 3000 RPM
+or higher. Both `curve` and `watch` verify fan commands before changing
+the color. An LED error is logged and retried while cooling continues.
+The service publishes the acknowledged color in `lighting_status`.
+
+Existing configurations without `mac_fan_points` keep their original behavior.
+
 Stop the service before issuing manual hardware commands or running the
 interactive controller:
 
@@ -135,6 +158,35 @@ padctl --verify rgb brightness 50
 `fan get` reports the last acknowledged fan command. Lighting/firmware
 queries replace that response buffer: `fan get` then returns an error and
 `status` reports a null commanded RPM. Neither measures actual RPM.
+
+### Unattended macOS service evaluation
+
+The controller writes fan decisions, USB acknowledgements, errors, reconnects
+and idle heartbeats to `~/Library/Logs/padctl.log`. To check the service while
+it owns the pad, install the independent evaluator from this checkout:
+
+```sh
+mkdir -p ~/.local/bin ~/Library/LaunchAgents
+install -m 755 tools/padctl-eval ~/.local/bin/padctl-eval
+install -m 644 packaging/launchd/io.github.hbmartin.padctl.eval.plist ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/io.github.hbmartin.padctl.eval.plist
+```
+
+The login agent records a result every minute while the Mac is awake. Each
+check requires a running launchd controller, a fresh and connected snapshot,
+an acknowledged fan command, valid die/GPU/thermal readings, a current event
+log and a clear controller error field. It runs independently of the controller
+and leaves the pad available for automatic control.
+
+```sh
+~/.local/bin/padctl-eval                 # JSON on stdout, exit 0 on pass or 1 on failure
+tail -n 5 ~/Library/Logs/padctl-eval.jsonl
+tail -f ~/Library/Logs/padctl.log
+```
+
+The evaluation history contains UTC timestamps, readings and failure reasons.
+It rotates at 1 MiB with four backups. Check the timestamp as well as `ok`
+when reading history. The most recent row describes the instant it was sampled.
 
 ## Development and validation
 

@@ -33,6 +33,9 @@ pub enum OnExit {
 
 #[derive(Args, Default)]
 pub struct CurveArgs {
+    /// Measured Mac fan RPM:pad RPM points. Uses the fastest internal fan.
+    #[arg(long)]
+    pub(crate) mac_fan_points: Option<String>,
     /// GPU utilization percent:RPM curve; higher of GPU and temperature targets wins
     #[arg(long)]
     pub(crate) gpu_points: Option<String>,
@@ -83,6 +86,7 @@ const DEFAULT_DOWN_DELAY: u64 = 30;
 /// Curve settings after merging CLI flags, the config file, and defaults
 /// (in that precedence order).
 pub struct Settings {
+    pub mac_fan_points: Vec<(f64, u32)>,
     pub gpu_points: Vec<(f64, u32)>,
     pub points: Vec<(f64, u32)>,
     pub points_text: String,
@@ -93,6 +97,13 @@ pub struct Settings {
 }
 
 pub fn resolve(args: &CurveArgs, file: Option<&CurveConfig>) -> Result<Settings> {
+    let mac_fan_points = args
+        .mac_fan_points
+        .as_deref()
+        .or_else(|| file.and_then(|c| c.mac_fan_points.as_deref()))
+        .map(|text| parse_bounded_points(text, 20000.0, "Mac fan RPM"))
+        .transpose()?
+        .unwrap_or_default();
     let gpu_text = args
         .gpu_points
         .as_deref()
@@ -139,6 +150,7 @@ pub fn resolve(args: &CurveArgs, file: Option<&CurveConfig>) -> Result<Settings>
         .unwrap_or(DEFAULT_DOWN_DELAY);
 
     Ok(Settings {
+        mac_fan_points,
         gpu_points,
         points,
         points_text,
@@ -151,21 +163,25 @@ pub fn resolve(args: &CurveArgs, file: Option<&CurveConfig>) -> Result<Settings>
 
 /// Parse "temp:rpm,temp:rpm,..." into a sorted curve (RPM 0 = fans off).
 pub fn parse_points(s: &str) -> Result<Vec<(f64, u32)>> {
+    parse_bounded_points(s, 125.0, "temperature in Celsius")
+}
+
+fn parse_bounded_points(s: &str, maximum: f64, input: &str) -> Result<Vec<(f64, u32)>> {
     let mut points = Vec::new();
     for pair in s.split(',') {
         let (t, r) = pair
             .split_once(':')
-            .with_context(|| format!("bad curve point {pair:?}, expected temp:rpm"))?;
+            .with_context(|| format!("bad curve point {pair:?}, expected input:rpm"))?;
         let temp: f64 = t
             .trim()
             .parse()
-            .with_context(|| format!("bad temperature in {pair:?}"))?;
+            .with_context(|| format!("bad {input} in {pair:?}"))?;
         let rpm: u32 = r
             .trim()
             .parse()
             .with_context(|| format!("bad RPM in {pair:?}"))?;
-        if !temp.is_finite() || !(0.0..=125.0).contains(&temp) {
-            bail!("curve temperature must be finite and between 0 and 125 Celsius");
+        if !temp.is_finite() || !(0.0..=maximum).contains(&temp) {
+            bail!("curve {input} must be finite and between 0 and {maximum}");
         }
         if rpm != 0 && !(fan::MIN_RPM..=fan::MAX_RPM).contains(&rpm) {
             bail!(
@@ -181,7 +197,7 @@ pub fn parse_points(s: &str) -> Result<Vec<(f64, u32)>> {
         .windows(2)
         .any(|w| w[0].0 == w[1].0 || w[0].1 > w[1].1)
     {
-        bail!("curve temperatures must be unique and RPM must not decrease with temperature");
+        bail!("curve inputs must be unique and requested RPM must not decrease");
     }
     if points.is_empty() {
         bail!("curve needs at least one point");
@@ -344,18 +360,28 @@ pub(crate) struct TickOutcome {
 /// The per-tick control step shared by `curve` and `watch`: EMA smoothing,
 /// curve interpolation, device-range normalization, and governor gating.
 pub(crate) struct Controller {
+    mac_fan_points: Vec<(f64, u32)>,
     gpu_points: Vec<(f64, u32)>,
-    gpu_floor: u32,
+    load_floor: u32,
+    high_pressure: bool,
     points: Vec<(f64, u32)>,
     ema: Ema,
     governor: Governor,
 }
 
+pub(crate) struct LoadSample {
+    pub gpu_percent: f64,
+    pub pressure: u8,
+    pub mac_fans_rpm: Option<Vec<u32>>,
+}
+
 impl Controller {
     pub(crate) fn new(points: Vec<(f64, u32)>, smooth: f64, down_delay: Duration) -> Self {
         Controller {
+            mac_fan_points: Vec::new(),
             gpu_points: Vec::new(),
-            gpu_floor: 0,
+            load_floor: 0,
+            high_pressure: false,
             points,
             ema: Ema::new(smooth),
             governor: Governor::new(HYSTERESIS_RPM, down_delay),
@@ -367,23 +393,28 @@ impl Controller {
     pub(crate) fn tick(&mut self, raw: f64, dt: f64, now: Instant) -> TickOutcome {
         let smoothed = self.ema.update(raw, dt);
         // Do not let smoothing delay the configured hottest-point response.
-        let control_temp = if raw >= self.points.last().unwrap().0 {
-            raw
-        } else {
-            smoothed
-        };
-        let raw_target = target_rpm(&self.points, control_temp).max(self.gpu_floor);
+        let hottest = raw >= self.points.last().unwrap().0;
+        let control_temp = if hottest { raw } else { smoothed };
+        let raw_target = target_rpm(&self.points, control_temp).max(self.load_floor);
         // Below the device minimum means off.
         let target = if raw_target < fan::MIN_RPM {
             0
         } else {
             fan::normalize_rpm(raw_target)
         };
+        // An urgent increase can be one 50 RPM step, below normal hysteresis.
+        let decision = if (hottest || self.high_pressure)
+            && self.applied().is_some_and(|last| last < target)
+        {
+            Decision::Send
+        } else {
+            self.governor.decide(target, now)
+        };
         TickOutcome {
             raw,
             smoothed,
             target,
-            decision: self.governor.decide(target, now),
+            decision,
         }
     }
 
@@ -411,6 +442,37 @@ impl Controller {
 
 /// Live-tuning mutators, for adjusting the running curve interactively.
 impl Controller {
+    pub(crate) fn configure_mac_fans(&mut self, points: Vec<(f64, u32)>) {
+        self.mac_fan_points = points;
+    }
+
+    pub(crate) fn sample_load(&mut self) -> Result<LoadSample> {
+        let gpu_percent = crate::gpu::read_percent().context("GPU utilization")?;
+        let pressure = crate::gpu::thermal_pressure().context("thermal pressure")?;
+        self.set_gpu_load(gpu_percent)?;
+        self.apply_pressure(pressure);
+        let mac_fans_rpm = if self.mac_fan_points.is_empty() {
+            None
+        } else {
+            let fans = crate::mac_fans::read_rpm().context("Mac fan telemetry")?;
+            self.apply_mac_fans(&fans)?;
+            Some(fans)
+        };
+        Ok(LoadSample {
+            gpu_percent,
+            pressure,
+            mac_fans_rpm,
+        })
+    }
+
+    fn apply_mac_fans(&mut self, fans: &[u32]) -> Result<()> {
+        let fastest = *fans.iter().max().context("no internal fan readings")?;
+        self.load_floor = self
+            .load_floor
+            .max(target_rpm(&self.mac_fan_points, f64::from(fastest)));
+        Ok(())
+    }
+
     pub(crate) fn configure_gpu(&mut self, points: Vec<(f64, u32)>) {
         self.gpu_points = points;
     }
@@ -420,13 +482,14 @@ impl Controller {
         if self.gpu_points.is_empty() {
             bail!("GPU curve is not configured");
         }
-        self.gpu_floor = target_rpm(&self.gpu_points, percent);
+        self.load_floor = target_rpm(&self.gpu_points, percent);
         Ok(())
     }
 
     pub(crate) fn apply_pressure(&mut self, state: u8) {
-        if state >= 2 {
-            self.gpu_floor = self.gpu_floor.max(3000);
+        self.high_pressure = state >= 2;
+        if self.high_pressure {
+            self.load_floor = self.load_floor.max(3000);
         }
     }
     /// Change the smoothing time constant without disturbing the current
@@ -470,6 +533,28 @@ pub(crate) fn rpm_text(rpm: u32) -> String {
     }
 }
 
+fn sync_indicator(
+    lighting: &mut Option<crate::lighting::Plan>,
+    pad: Option<&Pad>,
+    snapshot: &mut crate::status::Snapshot,
+) {
+    match crate::lighting::sync_status(lighting.as_mut(), pad, snapshot.fan_commanded_rpm) {
+        Ok(state) => snapshot.lighting_status = state,
+        Err(error) => {
+            let message = format!("status light failed: {error:#}");
+            log::warn!("{message}");
+            snapshot.lighting_status = None;
+            match &mut snapshot.error {
+                Some(existing) => {
+                    existing.push_str("; ");
+                    existing.push_str(&message);
+                }
+                None => snapshot.error = Some(message),
+            }
+        }
+    }
+}
+
 pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArgs) -> Result<()> {
     let file_config = if args.no_config {
         None
@@ -479,9 +564,13 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
     let s = resolve(&args, file_config.as_ref().map(|c| &c.curve))?;
     // Validate the [lighting] section up front so a broken config fails
     // loudly at startup instead of on the first reconnect.
-    let lighting = match &file_config {
+    let mut lighting = match &file_config {
         Some(c) => crate::lighting::plan(&c.lighting)?,
         None => None,
+    };
+
+    let opts = OpenOpts {
+        verify: opts.verify || lighting.as_ref().is_some_and(|plan| plan.fan_status),
     };
 
     let reader = TempReader::new()?;
@@ -529,6 +618,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
     );
     let mut pending_reported = false;
     controller.configure_gpu(s.gpu_points.clone());
+    controller.configure_mac_fans(s.mac_fan_points.clone());
     let mut last_status_log = Instant::now();
     let publisher = if args.dry_run {
         None
@@ -559,6 +649,8 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                         {
                             match p.send(&fan::off()) {
                                 Ok(()) => {
+                                    snapshot.fan_commanded_rpm = opts.verify.then_some(0);
+                                    sync_indicator(&mut lighting, Some(p), &mut snapshot);
                                     log::info!("fan off for sleep");
                                     controller.reset();
                                 }
@@ -584,6 +676,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                 snapshot.connected = false;
                 snapshot.fan_commanded_rpm = None;
                 snapshot.error = Some("Mac is sleeping".into());
+                snapshot.lighting_status = None;
                 crate::status::publish(&publisher, &mut snapshot);
                 // Nothing useful to do until wake; check again shortly so
                 // the wake is handled promptly.
@@ -612,8 +705,8 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                     outage_reported = false;
                     // The pad may have rebooted: restore lighting and make
                     // sure the next fan target is resent.
-                    if let Some(plan) = &lighting {
-                        match plan.packets.iter().try_for_each(|pkt| p.send(pkt)) {
+                    if let Some(plan) = &mut lighting {
+                        match plan.connect(&p) {
                             Ok(()) => log::info!("lighting: {}", plan.summary),
                             Err(e) => log::warn!("failed to apply lighting: {e:#}"),
                         }
@@ -638,13 +731,15 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
         } else {
             None
         };
-        let gpu_result =
-            crate::gpu::read_percent().and_then(|p| crate::gpu::thermal_pressure().map(|s| (p, s)));
-        let (gpu_percent, pressure) = match gpu_result {
+        let LoadSample {
+            gpu_percent,
+            pressure,
+            mac_fans_rpm,
+        } = match controller.sample_load() {
             Ok(sample) => sample,
             Err(e) => {
-                log::error!("GPU telemetry failed: {e:#}");
-                snapshot.error = Some(format!("GPU telemetry failed: {e:#}"));
+                log::error!("load telemetry failed: {e:#}");
+                snapshot.error = Some(format!("load telemetry failed: {e:#}"));
                 match sensor_failure(&pad, args.dry_run) {
                     Ok(()) => snapshot.fan_commanded_rpm = opts.verify.then_some(3000),
                     Err(e) => {
@@ -654,14 +749,14 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                         snapshot.fan_commanded_rpm = None;
                     }
                 }
+                sync_indicator(&mut lighting, pad.as_ref(), &mut snapshot);
                 crate::status::publish(&publisher, &mut snapshot);
                 controller.reset_after_wake();
                 std::thread::sleep(Duration::from_secs(s.interval));
                 continue;
             }
         };
-        controller.set_gpu_load(gpu_percent)?;
-        controller.apply_pressure(pressure);
+        snapshot.mac_fans_rpm = mac_fans_rpm;
         snapshot.gpu_percent = Some(gpu_percent);
         snapshot.thermal_pressure = Some(crate::gpu::pressure_name(pressure));
         match reader.read() {
@@ -690,6 +785,10 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                 } else {
                     format!(" (GPU {gpu_percent:.0}%)")
                 };
+                let detail = match &snapshot.mac_fans_rpm {
+                    Some(fans) => format!("{detail} Mac fans {fans:?} RPM"),
+                    None => detail,
+                };
                 // Info only on decision changes + heartbeat; every poll at debug.
                 match decision {
                     Decision::Send => {
@@ -699,7 +798,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                     }
                     Decision::PendingDown if !pending_reported => {
                         log::info!(
-                            "{} .. {} (down pending)",
+                            "{} .. {} (down pending){detail}",
                             units::display(temp),
                             rpm_text(target)
                         );
@@ -712,7 +811,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                         }
                         if last_status_log.elapsed() >= HEARTBEAT {
                             log::info!(
-                                "{}, fan {} (heartbeat)",
+                                "{}, fan {}{detail} (heartbeat)",
                                 units::display(temp),
                                 rpm_text(controller.applied().unwrap_or(target)),
                             );
@@ -774,6 +873,7 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
         }
 
         snapshot.connected = pad.is_some();
+        sync_indicator(&mut lighting, pad.as_ref(), &mut snapshot);
         crate::status::publish(&publisher, &mut snapshot);
         // Sleep in small slices so signals exit promptly and sleep/wake
         // transitions are handled without waiting out the poll interval.
@@ -794,10 +894,12 @@ pub fn run(api: &mut HidApi, selector: &Selector, opts: OpenOpts, args: CurveArg
                 Some(p) => match p.send(&fan::off()) {
                     Ok(()) => {
                         snapshot.fan_commanded_rpm = opts.verify.then_some(0);
+                        sync_indicator(&mut lighting, Some(p), &mut snapshot);
                         log::info!("fan off");
                     }
                     Err(e) => {
                         snapshot.fan_commanded_rpm = None;
+                        snapshot.lighting_status = None;
                         snapshot.error = Some(format!("failed to turn the fan off: {e:#}"));
                         log::warn!("failed to turn the fan off: {e:#}");
                     }
@@ -930,8 +1032,55 @@ mod tests {
     }
 
     #[test]
+    fn mac_profile_tracks_fastest_fan_and_preserves_thermal_overrides() {
+        let profile = crate::config::parse(include_str!("../config.mac-fans.toml")).unwrap();
+        let settings = resolve(&CurveArgs::default(), Some(&profile.curve)).unwrap();
+        let mut c = Controller::new(
+            settings.points,
+            settings.smooth,
+            Duration::from_secs(settings.down_delay),
+        );
+        c.configure_gpu(settings.gpu_points);
+        c.configure_mac_fans(settings.mac_fan_points);
+        let now = Instant::now();
+        let sample = |c: &mut Controller, fans: &[u32], die, pressure, elapsed| {
+            c.set_gpu_load(100.0).unwrap();
+            c.apply_pressure(pressure);
+            c.apply_mac_fans(fans).unwrap();
+            c.tick(die, 2.0, now + Duration::from_secs(elapsed))
+        };
+        assert_eq!(sample(&mut c, &[0, 0], 48.0, 0, 0).target, 0);
+        for fans in [[1, 0], [0, 1], [1345, 1449], [1400, 1800]] {
+            c.confirm(0);
+            let on = sample(&mut c, &fans, 50.0, 0, 2);
+            assert_eq!((on.target, on.decision), (500, Decision::Send));
+        }
+        c.confirm(500);
+        let ramp = sample(&mut c, &[3000, 1400], 50.0, 0, 6);
+        assert_eq!((ramp.target, ramp.decision), (1400, Decision::Send));
+        c.confirm(ramp.target);
+        assert_eq!(
+            sample(&mut c, &[0, 0], 50.0, 0, 8).decision,
+            Decision::PendingDown
+        );
+        let off = sample(&mut c, &[0, 0], 50.0, 0, 38);
+        assert_eq!((off.target, off.decision), (0, Decision::Send));
+        c.confirm(0);
+        assert_eq!(sample(&mut c, &[0, 0], 48.0, 2, 40).target, 3000);
+        assert_eq!(sample(&mut c, &[0, 0], 85.0, 0, 42).target, 3000);
+        c.confirm(2950);
+        assert_eq!(
+            sample(&mut c, &[0, 0], 50.0, 2, 44).decision,
+            Decision::Send
+        );
+        assert!(c.apply_mac_fans(&[]).is_err());
+        assert!(parse_bounded_points("20001:500", 20000.0, "Mac fan RPM").is_err());
+    }
+
+    #[test]
     fn resolve_precedence_cli_over_file_over_default() {
         let file = CurveConfig {
+            mac_fan_points: None,
             gpu_points: None,
             points: Some("50:0,70:2000".into()),
             interval: Some(10),

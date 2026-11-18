@@ -1,0 +1,16 @@
+# For a MacBook Pro with readable internal fan tachometers.
+[curve]
+# Fastest measured Mac fan RPM : commanded pad RPM
+mac_fan_points = "0:0,1:500,1800:500,2500:1000,3500:1800,5000:3000"
+# Smoothed die temperature (Celsius), with immediate response at 85 C.
+points = "75:0,80:1500,85:3000"
+# GPU activity alone does not start the pad in this profile.
+gpu_points = "0:0,100:0"
+interval = 2
+smooth = 5
+down_delay = 30
+on_exit = "keep"
+
+[lighting]
+effect = "fan-status"
+brightness = 35

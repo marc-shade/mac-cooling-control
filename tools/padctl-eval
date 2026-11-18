@@ -1,0 +1,130 @@
+#!/usr/bin/python3
+"""Evaluate the macOS padctl login service without opening the pad."""
+import argparse
+from datetime import datetime, timezone
+import json
+from logging.handlers import RotatingFileHandler
+import logging
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import time
+
+LABEL = "io.github.hbmartin.padctl"
+HOME = Path.home()
+STATUS = HOME / "Library/Caches/padctl/status.json"
+LOG = HOME / "Library/Logs/padctl.log"
+HISTORY = HOME / "Library/Logs/padctl-eval.jsonl"
+
+
+def in_range(value, low, high):
+    return type(value) in (int, float) and low <= value <= high
+
+
+def check_snapshot(sample, now, result, errors):
+    if not isinstance(sample, dict) or type(sample.get("schema_version")) is not int or sample["schema_version"] != 1:
+        errors.append("missing or unsupported status schema")
+        return
+    updated = sample.get("updated_at")
+    ttl = sample.get("valid_for_seconds")
+    if not in_range(updated, 0, now + 5) or type(ttl) is not int or not 1 <= ttl <= 900:
+        errors.append("invalid snapshot timestamp or freshness window")
+    else:
+        result["sample_age_s"] = round(now - updated, 2)
+        if now - updated > ttl:
+            errors.append("stale controller snapshot")
+
+    if sample.get("running") is not True:
+        errors.append("controller did not report running")
+    if sample.get("connected") is not True:
+        errors.append("pad did not report connected")
+    if "error" not in sample or sample["error"] is not None:
+        errors.append("controller error: " + str(sample.get("error", "missing error field")))
+
+    rpm = sample.get("fan_commanded_rpm")
+    if type(rpm) is int and (rpm == 0 or 500 <= rpm <= 3200 and rpm % 50 == 0):
+        result["acknowledged_rpm"] = rpm
+    else:
+        errors.append("missing or invalid acknowledged RPM")
+    for field, high in (("die_celsius", 125), ("gpu_percent", 100)):
+        if in_range(sample.get(field), 0, high):
+            result[field] = sample[field]
+        else:
+            errors.append("missing or invalid " + field)
+    pressure = sample.get("thermal_pressure")
+    if pressure in ("nominal", "fair", "serious", "critical"):
+        result["thermal_pressure"] = pressure
+    else:
+        errors.append("unknown thermal pressure")
+
+
+def evaluate():
+    result = {"checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    errors = []
+    try:
+        job = subprocess.run(
+            ["/bin/launchctl", "print", f"gui/{os.getuid()}/{LABEL}"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        pid = re.search(r"^\tpid = ([1-9][0-9]*)$", job.stdout, re.MULTILINE)
+        if job.returncode or not pid or "\n\tstate = running\n" not in job.stdout:
+            errors.append("launchd controller is not running")
+        else:
+            result["controller_pid"] = int(pid[1])
+    except (OSError, subprocess.SubprocessError) as exc:
+        errors.append(f"launchctl check failed: {exc}")
+
+    ttl = 15
+    try:
+        with STATUS.open("rb") as stream:
+            raw = stream.read(65537)
+        if len(raw) > 65536:
+            raise ValueError("file exceeds 64 KiB")
+        sample = json.loads(raw)
+        check_snapshot(sample, time.time(), result, errors)
+        if isinstance(sample, dict) and type(sample.get("valid_for_seconds")) is int:
+            ttl = min(900, max(1, sample["valid_for_seconds"]))
+    except (OSError, ValueError, RecursionError) as exc:
+        errors.append(f"cannot read controller snapshot: {exc}")
+
+    try:
+        info = LOG.stat()
+        age = time.time() - info.st_mtime
+        result["controller_log_age_s"] = round(age, 1)
+        # The curve logs at least once per ten minutes on a healthy, steady curve.
+        if not stat.S_ISREG(info.st_mode) or info.st_size == 0 or not -5 <= age <= 600 + ttl:
+            errors.append("controller event log is empty, stale, or invalid")
+    except OSError as exc:
+        errors.append(f"controller event log unavailable: {exc}")
+    result["ok"] = not errors
+    result["errors"] = errors
+    return result
+
+
+class HistoryHandler(RotatingFileHandler):
+    def handleError(self, record):
+        raise  # A scheduled run must fail if its result cannot be recorded.
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--record", action="store_true", help="append the scheduled result to the rotating evaluation log")
+    args = parser.parse_args()
+    result = evaluate()
+    line = json.dumps(result, allow_nan=False, separators=(",", ":"))
+    if args.record:
+        os.umask(0o077)
+        handler = HistoryHandler(HISTORY, maxBytes=1024 * 1024, backupCount=4, encoding="utf-8")
+        try:
+            handler.emit(logging.makeLogRecord({"msg": line}))
+        finally:
+            handler.close()
+    else:
+        print(line)
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

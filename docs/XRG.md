@@ -19,6 +19,8 @@ publish this feed.
 | `running` | Whether the controller is active; false on clean exit |
 | `connected` | Whether the last poll retained a working USB connection |
 | `fan_commanded_rpm` | Last acknowledged command, or null without verification/connection/acknowledgement |
+| `lighting_status` | Acknowledged automatic status light (off, blue, amber or red), or null when unavailable. |
+| `mac_fans_rpm` | Measured Mac fan speeds in fan index order when the internal fan curve is enabled and readings are available. Zero means the fan is stopped. |
 | `fan_measured_rpm` | Null; no validated tachometer measurement |
 | `pad_temperature_celsius` | Null; no validated pad-temperature measurement |
 | `die_celsius`, `die_fahrenheit` | Current Mac die sample in explicitly named units, or null on telemetry failure |

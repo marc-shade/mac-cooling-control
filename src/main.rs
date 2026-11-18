@@ -58,7 +58,7 @@ impl Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Read live die temperature and GPU utilization without opening the pad
+    /// Read die temperature, GPU utilization and Mac fan speeds without opening the pad
     Telemetry,
     /// List the pad's HID interfaces
     List,
@@ -232,8 +232,11 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Telemetry => {
             let reader = temp::TempReader::new()?;
             let celsius = reader.read()?;
+            let fans = padctl::mac_fans::read_rpm();
             return print_json(&serde_json::json!({
                 "die_temperature": units::value(celsius),
+                "mac_fans_rpm": fans.as_ref().ok(),
+                "mac_fans_error": fans.as_ref().err().map(|e|format!("{e:#}")),
                 "temperature_unit": units::current().name(),
                 "die_fahrenheit": units::Unit::Fahrenheit.convert(celsius),
                 "die_celsius": celsius, "temperature_source": reader.source_name(),
@@ -352,6 +355,9 @@ fn run(cli: Cli) -> Result<()> {
                             .collect::<Vec<_>>()
                             .join(",")
                     );
+                    if !s.mac_fan_points.is_empty() {
+                        println!("Mac fan RPM → pad RPM: {:?}", s.mac_fan_points);
+                    }
                     println!("interval:     {}s", s.interval);
                     println!("on exit:      {:?}", s.on_exit);
                     println!("smooth:       {}s", s.smooth);
@@ -504,6 +510,10 @@ fn run(cli: Cli) -> Result<()> {
                     })?;
                     let plan = lighting::plan(&file.lighting)?
                         .context("the config has no [lighting] settings to apply")?;
+                    anyhow::ensure!(
+                        !plan.fan_status,
+                        "fan-status is applied automatically by curve and watch"
+                    );
                     for packet in &plan.packets {
                         pad.send(packet)?;
                     }
