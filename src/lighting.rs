@@ -2,7 +2,8 @@
 //! `padctl rgb apply` and the fan-curve startup/reconnect path so the
 //! launchd service can restore the preferred lighting at login.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
+use std::time::{Duration, Instant};
 
 use crate::config::LightingConfig;
 use crate::packet::Packet;
@@ -14,6 +15,104 @@ pub struct Plan {
     pub packets: Vec<Packet>,
     /// Human-readable description, e.g. `brightness 80%, static #ff6600`.
     pub summary: String,
+    pub fan_status: bool,
+    applied: Option<(Band, Instant)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Band {
+    Off,
+    Blue,
+    Amber,
+    Red,
+}
+
+impl Band {
+    fn for_rpm(rpm: u32) -> Self {
+        match rpm {
+            0 => Self::Off,
+            1..1500 => Self::Blue,
+            1500..3000 => Self::Amber,
+            _ => Self::Red,
+        }
+    }
+
+    fn effect(self) -> (&'static str, Option<rgb::Rgb>) {
+        match self {
+            Self::Off => ("off", None),
+            Self::Blue => ("blue", Some((0, 0, 255))),
+            Self::Amber => ("amber", Some((255, 160, 0))),
+            Self::Red => ("red", Some((255, 0, 0))),
+        }
+    }
+}
+
+impl Plan {
+    pub fn connect(&mut self, pad: &crate::device::Pad) -> Result<()> {
+        self.applied = None;
+        if !self.fan_status {
+            self.packets
+                .iter()
+                .try_for_each(|packet| pad.send(packet))?;
+        }
+        Ok(())
+    }
+}
+
+/// Called only with an acknowledged fan command. A failed LED write is
+/// retried on the next poll without disturbing the fan governor.
+pub fn sync_status(
+    plan: Option<&mut Plan>,
+    pad: Option<&crate::device::Pad>,
+    acknowledged_rpm: Option<u32>,
+) -> Result<Option<&'static str>> {
+    let Some(plan) = plan.filter(|p| p.fan_status) else {
+        return Ok(None);
+    };
+    let (Some(pad), Some(rpm)) = (pad, acknowledged_rpm) else {
+        plan.applied = None;
+        return Ok(None);
+    };
+    let band = Band::for_rpm(rpm);
+    let (name, color) = band.effect();
+    if let Some((last, checked)) = plan.applied
+        && last == band
+    {
+        if checked.elapsed() < Duration::from_secs(30) {
+            return Ok(Some(name));
+        }
+        plan.applied = None;
+        if active_effect_matches(pad, color)? {
+            plan.applied = Some((band, Instant::now()));
+            return Ok(Some(name));
+        }
+        log::warn!("active status light differs from {name} at {rpm} RPM; restoring");
+    }
+    if plan.applied.take().is_none() {
+        plan.packets.iter().try_for_each(|p| pad.send(p))?;
+    }
+    pad.send(&rgb::live_solid(color))?;
+    ensure!(
+        active_effect_matches(pad, color)?,
+        "active effect did not change to {name}"
+    );
+    plan.applied = Some((band, Instant::now()));
+    log::info!("active status light read back: {name} for {rpm} RPM");
+    Ok(Some(name))
+}
+
+fn active_effect_matches(pad: &crate::device::Pad, color: Option<rgb::Rgb>) -> Result<bool> {
+    let response = pad.query(&rgb::active_effect_get())?;
+    ensure!(
+        response.data_size >= 9,
+        "short active lighting effect response"
+    );
+    let args = response.args;
+    // In off mode the firmware can retain the previous RGB bytes.
+    Ok(match color {
+        None => args[2] == 0,
+        Some((r, g, b)) => args[2] == 1 && args[5] == 1 && args[6..9] == [r, g, b],
+    })
 }
 
 /// Validate `cfg` and build the packets it describes. `Ok(None)` means the
@@ -53,6 +152,10 @@ pub fn plan(cfg: &LightingConfig) -> Result<Option<Plan>> {
             if !colors.is_empty() {
                 bail!("lighting colors need an effect (e.g. effect = \"static\")");
             }
+        }
+        Some("fan-status") => {
+            expect_colors(&colors, 0, "fan-status")?;
+            parts.push("fan status (acknowledged RPM)".into());
         }
         Some("off") => {
             expect_colors(&colors, 0, "off")?;
@@ -117,16 +220,18 @@ pub fn plan(cfg: &LightingConfig) -> Result<Option<Plan>> {
         }
         Some(other) => bail!(
             "unknown lighting effect {other:?}: use off, static, spectrum, wave, \
-             breath, gradient or custom"
+             breath, gradient, custom or fan-status"
         ),
     }
 
-    if packets.is_empty() {
+    if parts.is_empty() {
         return Ok(None);
     }
     Ok(Some(Plan {
         packets,
         summary: parts.join(", "),
+        fan_status: effect == Some("fan-status"),
+        applied: None,
     }))
 }
 
@@ -165,6 +270,37 @@ mod tests {
     #[test]
     fn empty_section_is_none() {
         assert!(plan(&cfg()).unwrap().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires the actual pad, the user service stopped, and a running low-speed fan"]
+    fn hardware_recovers_active_blue_after_same_band_drift() {
+        use crate::device::{OpenOpts, Pad, Selector};
+        let api = crate::device::api().unwrap();
+        let pad = Pad::open(&api, &Selector::default(), OpenOpts { verify: true }).unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                    .join("Library/Caches/padctl/status.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rpm = snapshot["fan_commanded_rpm"].as_u64().unwrap() as u32;
+        assert!(matches!(Band::for_rpm(rpm), Band::Blue));
+        let config = crate::config::parse(include_str!("../config.mac-fans.toml")).unwrap();
+        let mut plan = plan(&config.lighting).unwrap().unwrap();
+        sync_status(Some(&mut plan), Some(&pad), Some(rpm)).unwrap();
+        // Change only the LEDs, leaving the physical fan command in force.
+        pad.send(&rgb::live_solid(None)).unwrap();
+        assert!(active_effect_matches(&pad, None).unwrap());
+        plan.applied = Some((Band::Blue, Instant::now() - Duration::from_secs(31)));
+        assert_eq!(
+            sync_status(Some(&mut plan), Some(&pad), Some(rpm)).unwrap(),
+            Some("blue")
+        );
+        assert!(active_effect_matches(&pad, Some((0, 0, 255))).unwrap());
     }
 
     #[test]

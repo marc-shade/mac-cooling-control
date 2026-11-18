@@ -17,6 +17,7 @@ pub mod fan;
 pub mod gpu;
 pub mod lighting;
 pub mod logging;
+pub mod mac_fans;
 pub mod packet;
 pub mod parse;
 pub mod power;

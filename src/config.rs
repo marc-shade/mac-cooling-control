@@ -19,6 +19,8 @@ pub struct Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurveConfig {
+    /// Measured Mac fan RPM to external pad RPM; disabled when omitted.
+    pub mac_fan_points: Option<String>,
     /// GPU utilization percent:RPM points, used as a floor below the temperature target.
     pub gpu_points: Option<String>,
     /// Curve points as "temp:rpm,temp:rpm,..." (same format as --points).
@@ -39,7 +41,7 @@ pub struct CurveConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LightingConfig {
-    /// "off", "static", "spectrum", "wave", "breath", "gradient" or "custom".
+    /// "off", "static", "spectrum", "wave", "breath", "gradient", "custom" or "fan-status".
     pub effect: Option<String>,
     /// Colors as 6-hex-digit strings; how many depends on the effect.
     pub colors: Option<Vec<String>>,
@@ -81,7 +83,7 @@ pub const TEMPLATE: &str = r#"# padctl configuration.
 # it at login) and on `padctl rgb apply`. Leave everything commented out to
 # leave the lighting alone.
 [lighting]
-# Effect: "off", "static", "spectrum", "wave", "breath", "gradient", "custom".
+# Effect: "off", "static", "spectrum", "wave", "breath", "gradient", "custom", "fan-status".
 #effect = "static"
 
 # Colors as 6-hex-digit strings. static: 1 color; breath: 0-2 colors;

@@ -64,6 +64,9 @@ pub fn run(
         Some(c) => lighting::plan(&c.lighting)?,
         None => None,
     };
+    let opts = OpenOpts {
+        verify: opts.verify || lighting.as_ref().is_some_and(|plan| plan.fan_status),
+    };
     let reader = TempReader::new()?;
 
     // Signal handling for SIGTERM/SIGHUP; in raw mode Ctrl-C arrives as a
@@ -92,6 +95,7 @@ pub fn run(
             match &pad {
                 Some(p) => {
                     p.send(&fan::off())?;
+                    lighting::sync_status(app.lighting.as_mut(), Some(p), Some(0))?;
                     println!("fan off");
                 }
                 None => eprintln!("warning: pad unavailable, could not turn the fan off"),
@@ -172,6 +176,7 @@ struct App<'a> {
     dirty: bool,
     actual_rpm: Option<u32>,
     gpu_percent: Option<f64>,
+    mac_fans_rpm: Option<Vec<u32>>,
     started: Instant,
     last_tick: Option<Instant>,
     next_tick: Instant,
@@ -195,6 +200,7 @@ impl<'a> App<'a> {
             Duration::from_secs(s.down_delay),
         );
         controller.configure_gpu(s.gpu_points.clone());
+        controller.configure_mac_fans(s.mac_fan_points.clone());
         App {
             controller,
             interval: Duration::from_secs(s.interval),
@@ -221,6 +227,7 @@ impl<'a> App<'a> {
             dirty: false,
             actual_rpm: None,
             gpu_percent: None,
+            mac_fans_rpm: None,
             started: now,
             last_tick: None,
             next_tick: now,
@@ -252,9 +259,9 @@ impl<'a> App<'a> {
                     self.outage_reported = false;
                     // The pad may have rebooted: restore lighting and make
                     // sure the next fan target is resent.
-                    if let Some(plan) = &self.lighting {
+                    if let Some(plan) = &mut self.lighting {
                         let summary = plan.summary.clone();
-                        match plan.packets.iter().try_for_each(|pkt| p.send(pkt)) {
+                        match plan.connect(&p) {
                             Ok(()) => {
                                 self.push_event(EventKind::Info, format!("lighting: {summary}"));
                             }
@@ -278,16 +285,15 @@ impl<'a> App<'a> {
 
         let now = Instant::now();
         self.gpu_percent = None;
-        let raw = match crate::gpu::read_percent().and_then(|percent| {
-            self.gpu_percent = Some(percent);
-            self.controller.set_gpu_load(percent)?;
-            self.controller
-                .apply_pressure(crate::gpu::thermal_pressure()?);
+        self.mac_fans_rpm = None;
+        let raw = match self.controller.sample_load().and_then(|sample| {
+            self.gpu_percent = Some(sample.gpu_percent);
+            self.mac_fans_rpm = sample.mac_fans_rpm;
             self.reader.read()
         }) {
             Ok(raw) => raw,
             Err(e) => {
-                self.push_event(EventKind::Warn, format!("temperature read failed: {e:#}"));
+                self.push_event(EventKind::Warn, format!("control telemetry failed: {e:#}"));
                 match crate::curve::sensor_failure(&self.pad, self.dry_run) {
                     Ok(()) => self.push_event(
                         EventKind::Warn,
@@ -298,6 +304,7 @@ impl<'a> App<'a> {
                         self.pad = None;
                     }
                 }
+                self.sync_indicator(Some(3000));
                 self.controller.reset();
                 return;
             }
@@ -387,7 +394,13 @@ impl<'a> App<'a> {
             && let Some(p) = &self.pad
         {
             match p.read_report() {
-                Ok(report) => self.actual_rpm = fan::rpm_from_report(&report),
+                Ok(report) => {
+                    self.actual_rpm = if self.opts.verify {
+                        self.controller.applied()
+                    } else {
+                        fan::rpm_from_report(&report)
+                    }
+                }
                 Err(e) => {
                     self.push_event(
                         EventKind::Warn,
@@ -398,6 +411,7 @@ impl<'a> App<'a> {
             }
         }
 
+        self.sync_indicator(self.controller.applied());
         if self.history.len() == HISTORY_CAP {
             self.history.pop_front();
         }
@@ -408,6 +422,12 @@ impl<'a> App<'a> {
             target: out.target,
             actual: self.actual_rpm,
         });
+    }
+
+    fn sync_indicator(&mut self, rpm: Option<u32>) {
+        if let Err(error) = lighting::sync_status(self.lighting.as_mut(), self.pad.as_ref(), rpm) {
+            self.push_event(EventKind::Warn, format!("status light failed: {error:#}"));
+        }
     }
 
     fn apply(&mut self, action: Action) {
@@ -687,15 +707,25 @@ fn tile<'t>(title: &'t str, value: String, color: Color) -> Paragraph<'t> {
 }
 
 fn draw_tiles(f: &mut Frame, app: &App, area: Rect) {
-    let [raw, smoothed, gpu, target, actual] = Layout::horizontal([
-        Constraint::Percentage(20),
-        Constraint::Percentage(20),
-        Constraint::Percentage(20),
-        Constraint::Percentage(20),
-        Constraint::Percentage(20),
+    let [raw, smoothed, gpu, fans, target, actual] = Layout::horizontal([
+        Constraint::Ratio(1, 6),
+        Constraint::Ratio(1, 6),
+        Constraint::Ratio(1, 6),
+        Constraint::Ratio(1, 6),
+        Constraint::Ratio(1, 6),
+        Constraint::Ratio(1, 6),
     ])
     .areas(area);
     let last = app.history.back();
+    let fastest = app.mac_fans_rpm.as_ref().and_then(|fans| fans.iter().max());
+    f.render_widget(
+        tile(
+            "Mac fan max",
+            fastest.map_or("n/a".into(), |rpm| format!("{rpm} RPM")),
+            RAW_COLOR,
+        ),
+        fans,
+    );
     let fmt_temp = |v: Option<f64>| v.map_or("unavailable".into(), units::display);
     f.render_widget(tile("raw", fmt_temp(last.map(|s| s.raw)), RAW_COLOR), raw);
     f.render_widget(
