@@ -120,7 +120,7 @@ The profile also enables `[lighting]` with `effect = "fan-status"` and
 blue below 1500 RPM, amber from 1500 through 2950 RPM, and red at 3000 RPM
 or higher. Both `curve` and `watch` verify fan commands before changing
 the color. An LED error is logged and retried while cooling continues.
-The service publishes the acknowledged color in `lighting_status`.
+The service reads the active effect back after each change and every 30 seconds while steady. It restores a mismatched effect and publishes the last confirmed setting in `lighting_status`.
 
 Existing configurations without `mac_fan_points` keep their original behavior.
 

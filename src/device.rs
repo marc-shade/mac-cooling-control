@@ -290,6 +290,13 @@ impl Pad {
                 }
                 Status::Ok | Status::New => {
                     let sent = packet.to_report();
+                    if self.verify
+                        && (resp.status != Status::Ok
+                            || resp.transaction_id != sent[2]
+                            || report[89] != crate::packet::crc(&report[1..]))
+                    {
+                        bail!("verify: invalid query response status, transaction or checksum");
+                    }
                     if resp.class != sent[7] || resp.cmd != sent[8] {
                         bail!(
                             "response does not echo the request (got class 0x{:02x} cmd 0x{:02x}, \
@@ -481,29 +488,44 @@ mod tests {
         );
         assert_eq!(mock.sent_count(), 0);
         let brightness = rgb::brightness_set(89);
-        let blue = rgb::static_color(0, 0, 255);
-        let amber = rgb::static_color(255, 160, 0);
+        let blue = rgb::live_solid(Some((0, 0, 255)));
+        let amber = rgb::live_solid(Some((255, 160, 0)));
+        let red = rgb::live_solid(Some((255, 0, 0)));
+        let off = rgb::live_solid(None);
+        let readback = |effect: &Packet| {
+            let mut response = echo(&rgb::active_effect_get(), 2);
+            response[9..18].copy_from_slice(&effect.to_report()[9..18]);
+            response[89] = crate::packet::crc(&response[1..]);
+            response
+        };
         mock.script_read(echo(&brightness, 2));
         mock.script_read(echo(&blue, 2));
+        mock.script_read(readback(&blue));
         let mut update = |rpm| sync_status(Some(&mut plan), Some(&pad), Some(rpm));
         assert_eq!(update(500).unwrap(), Some("blue"));
         assert_eq!(update(1450).unwrap(), Some("blue"));
-        assert_eq!(mock.sent_count(), 2);
-        mock.script_read(echo(&blue, 2));
+        assert_eq!(mock.sent_count(), 3);
+        // A successful write echo can coexist with a different active color.
+        mock.script_read(echo(&amber, 2));
+        mock.script_read(readback(&blue));
         assert!(update(1500).is_err());
         mock.script_read(echo(&brightness, 2));
         mock.script_read(echo(&amber, 3));
         assert!(update(1500).is_err());
         mock.script_read(echo(&brightness, 2));
         mock.script_read(echo(&amber, 2));
+        mock.script_read(readback(&amber));
         assert_eq!(update(2950).unwrap(), Some("amber"));
-        mock.script_read(echo(&rgb::static_color(255, 0, 0), 2));
+        mock.script_read(echo(&red, 2));
+        mock.script_read(readback(&red));
         assert_eq!(update(3000).unwrap(), Some("red"));
-        mock.script_read(echo(&rgb::off(), 2));
+        mock.script_read(echo(&off, 2));
+        mock.script_read(readback(&off));
         assert_eq!(update(0).unwrap(), Some("off"));
         plan.connect(&pad).unwrap();
         mock.script_read(echo(&brightness, 2));
-        mock.script_read(echo(&rgb::off(), 2));
+        mock.script_read(echo(&off, 2));
+        mock.script_read(readback(&off));
         assert_eq!(
             sync_status(Some(&mut plan), Some(&pad), Some(0)).unwrap(),
             Some("off")

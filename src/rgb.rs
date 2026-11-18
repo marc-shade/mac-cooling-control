@@ -30,23 +30,45 @@ pub enum WaveDirection {
     Right,
 }
 
+fn solid_effect(storage: u8, color: Option<Rgb>) -> Packet {
+    match color {
+        None => Packet::new(
+            TID_RGB,
+            CLASS_EXTENDED_MATRIX,
+            CMD_EFFECT,
+            0x06,
+            &[storage, ZERO_LED, 0],
+        ),
+        Some((r, g, b)) => Packet::new(
+            TID_RGB,
+            CLASS_EXTENDED_MATRIX,
+            CMD_EFFECT,
+            0x09,
+            &[storage, ZERO_LED, 1, 0, 0, 1, r, g, b],
+        ),
+    }
+}
+
 pub fn off() -> Packet {
-    Packet::new(
-        TID_RGB,
-        CLASS_EXTENDED_MATRIX,
-        CMD_EFFECT,
-        0x06,
-        &[VARSTORE, ZERO_LED, 0x00],
-    )
+    solid_effect(VARSTORE, None)
 }
 
 pub fn static_color(r: u8, g: u8, b: u8) -> Packet {
+    solid_effect(VARSTORE, Some((r, g, b)))
+}
+
+/// Change the running effect without writing a stored profile.
+pub(crate) fn live_solid(color: Option<Rgb>) -> Packet {
+    solid_effect(NOSTORE, color)
+}
+
+pub(crate) fn active_effect_get() -> Packet {
     Packet::new(
         TID_RGB,
         CLASS_EXTENDED_MATRIX,
-        CMD_EFFECT,
-        0x09,
-        &[VARSTORE, ZERO_LED, 0x01, 0x00, 0x00, 0x01, r, g, b],
+        0x82,
+        0x0c,
+        &[NOSTORE, ZERO_LED],
     )
 }
 
